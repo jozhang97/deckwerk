@@ -154,14 +154,6 @@ const PAINT_READER = `((ids) => ids.map((id) => {
     ok: video.readyState >= 1 && video.videoWidth > 0,
     detail: video.videoWidth + 'x' + video.videoHeight,
   };
-  const embed = host?.querySelector('embed');
-  // A plugin surface exposes no decode state; that it exists, is typed as a
-  // PDF and has a box is all the page can tell us.
-  if (embed) return {
-    tag: 'embed',
-    ok: embed.type === 'application/pdf' && embed.getBoundingClientRect().width > 0,
-    detail: embed.type,
-  };
   return { tag: String(host?.firstElementChild?.tagName ?? 'missing'), ok: false, detail: '' };
 }))`;
 
@@ -229,13 +221,26 @@ describe.skipIf(!electronBinary)('media formats in the browser', () => {
     // The right rendering branch, not merely something that painted.
     expect(painted.map((value) => value.tag)).toEqual(
       media.map((name) => {
-        if (name.endsWith('.pdf')) return 'embed';
         return fixture(name).kind === 'video' ? 'video' : 'img';
       }),
     );
     // Converted formats are re-encoded, so their decoded size is the source's,
     // proving the conversion carried real pixels rather than a blank canvas.
     expect(painted[media.indexOf('photo.heic')].detail).toBe('64x48');
+
+    // The old <embed> assertion passed even when the PDF plugin painted
+    // nothing. Read actual pixels: this PDF contains a red rectangular stroke.
+    const pdfId = resolved[media.indexOf('paper.pdf')].id;
+    const pixel = await editor!.evaluate<number[]>(`(() => {
+      const image = document.querySelector('#canvas [data-element-id="${pdfId}"] img');
+      const canvas = document.createElement('canvas');
+      canvas.width = 140;
+      canvas.height = 105;
+      const context = canvas.getContext('2d');
+      context.drawImage(image, 0, 0, 140, 105);
+      return Array.from(context.getImageData(10, 50, 1, 1).data);
+    })()`);
+    expect(pixel).toEqual([255, 0, 0, 255]);
 
     // Every asset is fetchable from the server, so a reload or a peer sees it.
     for (const el of resolved) {

@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -101,15 +101,45 @@ describe('media import formats', () => {
     expect(h264.src).not.toContain('.h264.');
   }, 60_000);
 
-  it('substitutes a page-shaped box for a PDF, which nothing can probe', async () => {
+  it('converts a PDF figure to a vector image with its actual page dimensions', async () => {
     const deckDir = join(root, 'deck-pdf');
     await createDeck(deckDir);
 
     const asset = await importAsset(deckDir, files.get('paper.pdf')!);
 
     expect(asset.kind).toBe('image');
-    expect([asset.width, asset.height]).toEqual([1400, 1000]);
+    expect(asset.src).toMatch(/\.page-1\.svg$/);
+    expect([asset.width, asset.height]).toEqual([140, 105]);
+    const svg = await readFile(join(deckDir, asset.src), 'utf8');
+    expect(svg).toContain('<svg');
+    expect(svg).toContain('<path');
   }, 60_000);
+
+  it('reuses PDF figures and retains the source bytes on repeated and concurrent imports', async () => {
+    const deckDir = join(root, 'deck-pdf-repeat');
+    await createDeck(deckDir);
+    const source = files.get('paper.pdf')!;
+    const progress: (number | null)[] = [];
+    const first = await importAsset(deckDir, source, (ratio) => progress.push(ratio));
+    expect(progress).toEqual([null, 1]);
+    const before = await stat(join(deckDir, first.src));
+    const repeated = await Promise.all([importAsset(deckDir, source), importAsset(deckDir, source)]);
+    expect(repeated).toEqual([first, first]);
+    expect((await stat(join(deckDir, first.src))).mtimeMs).toBe(before.mtimeMs);
+    const names = await readdir(join(deckDir, 'assets'));
+    expect(names).toHaveLength(2);
+    const original = names.find((name) => name.endsWith('.pdf'))!;
+    expect(await readFile(join(deckDir, 'assets', original))).toEqual(await readFile(source));
+  });
+
+  it('rejects a malformed PDF without caching an empty figure', async () => {
+    const deckDir = join(root, 'deck-pdf-broken');
+    await createDeck(deckDir);
+    const source = join(root, 'broken.pdf');
+    await writeFile(source, '%PDF-1.4\nThis is not a PDF document.');
+    await expect(importAsset(deckDir, source)).rejects.toThrow(/PDF import failed/);
+    expect((await readdir(join(deckDir, 'assets'))).filter((name) => name.endsWith('.svg'))).toEqual([]);
+  });
 
   it('content-addresses every format, so a re-drop copies nothing', async () => {
     const deckDir = join(root, 'deck-dedupe');

@@ -9,6 +9,7 @@ import { serializeSpeakerNotes, SPEAKER_NOTES_FILE } from '@shared/speakerNotes.
 import { isWebSafeCodec, probeMedia, transcodeToH264, videoCodec } from './ffmpeg.js';
 import { needsFastStart, writeFastStart } from './mp4FastStart.js';
 import { convertHeicToPng } from './heic.js';
+import { convertPdfToSvg } from './pdfImport.js';
 
 /**
  * Reading and writing deck folders.
@@ -257,6 +258,17 @@ export async function importAsset(
   // importer does, and leave the original in place as the hashed source.
   let finalName = name;
 
+  // A native PDF plugin can exist without painting (including during export).
+  // SVG preserves the figure's vectors and uses the normal image pipeline.
+  // Keep the original alongside it so the source document is never lost.
+  if (ext === '.pdf') {
+    const converted = `${stem}.${hash}.page-1.svg`;
+    onProgress?.(null);
+    const dimensions = await convertPdfToSvg(dest, join(assetsDir, converted));
+    onProgress?.(1);
+    return { src: `${ASSETS_DIR}/${converted}`, kind, ...dimensions, duration: null };
+  }
+
   // iPhone photos: HEIC out to PNG. Decoding is not free, and there is no
   // duration to measure it against, so the placeholder just spins.
   if (kind === 'image' && CONVERTED_IMAGE_EXTS.has(ext)) {
@@ -291,12 +303,11 @@ export async function importAsset(
   const finalPath = join(assetsDir, finalName);
 
   const info = await probeMedia(finalPath);
-  const fallback = ext === '.pdf' ? { width: 1400, height: 1000 } : { width: null, height: null };
   return {
     src: `${ASSETS_DIR}/${finalName}`,
     kind,
-    width: info.width ?? fallback.width,
-    height: info.height ?? fallback.height,
+    width: info.width,
+    height: info.height,
     duration: info.duration,
   };
 }

@@ -17,7 +17,7 @@
     "build:export": "vite build --config vite.export.config.ts",
     "build:importer": "node scripts/build-importer.mjs",
     "prepare:media": "vite-node --config vitest.config.ts scripts/prepare-media.mts --",
-    "setup:importer": "python3 -m venv .venv-import && ./.venv-import/bin/pip install -q keynote-parser pillow",
+    "setup:importer": "python3 -m venv .venv-import && ./.venv-import/bin/pip install -q keynote-parser pillow pymupdf",
     "dist": "npm run build && npm run build:importer && electron-builder --config electron-builder.config.cjs --publish never",
     "dist:linux": "npm run build && npm run build:importer && electron-builder --linux --config electron-builder.config.cjs --publish never",
     "start": "electron-vite preview",

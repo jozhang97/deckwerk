@@ -150,9 +150,9 @@ export const MEDIA_FIXTURES: readonly MediaFixture[] = [
     name: 'paper.pdf',
     mime: 'application/pdf',
     kind: 'image',
-    src: /^assets\/paper\.[0-9a-f]{8}\.pdf$/,
-    converted: false,
-    // Nothing probes a PDF; importAsset substitutes a page-shaped default box.
+    src: /^assets\/paper\.[0-9a-f]{8}\.page-1\.svg$/,
+    converted: true,
+    // PDF page dimensions are checked separately from the 64x48 raster fixtures.
     sized: false,
     why: 'A figure dragged straight out of a paper.',
   },

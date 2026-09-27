@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 import unicodedata
 import warnings
@@ -3160,10 +3161,45 @@ def import_key(
         pkg.close()
 
 
+def pdf_figure(source: Path, destination: Path) -> dict:
+    """First page as a self-contained vector figure, with outlined fonts.
+
+    Use the same frozen MuPDF dependency as Keynote's embedded PDF conversion.
+    Atomic publication means failed or concurrent imports cannot cache a partial
+    SVG. The caller's destination is content-addressed, so repeat drops reuse it.
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise RuntimeError("PDF conversion requires PyMuPDF. Run npm run setup:importer.") from exc
+    with pymupdf.open(source) as document:
+        if document.needs_pass:
+            raise ValueError("This PDF is password-protected. Import an unlocked copy.")
+        if not document.is_pdf or document.page_count == 0:
+            raise ValueError("The file has no PDF pages.")
+        page = document.load_page(0)
+        if not destination.exists():
+            svg = page.get_svg_image(text_as_path=True)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf8", dir=destination.parent,
+                    suffix=".svg", delete=False,
+                ) as output:
+                    temporary = Path(output.name)
+                    output.write(svg)
+                temporary.replace(destination)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        return {"width": page.rect.width, "height": page.rect.height}
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Import a Keynote .key file.")
     parser.add_argument("input", type=Path, help="Path to a .key file or bundle")
     parser.add_argument("--out", type=Path, help="Deck folder to create")
+    parser.add_argument("--pdf-figure", action="store_true", help="Convert the first PDF page to an SVG at --out")
     parser.add_argument(
         "--report",
         action="store_true",
@@ -3184,6 +3220,17 @@ def main(argv: list[str]) -> int:
         # it as JSON. Libraries in the dependency tree (PyMuPDF in particular)
         # print warnings straight to stdout, which would corrupt it, so
         # everything the import emits is diverted to stderr.
+        with redirect_stdout(sys.stderr):
+            if args.pdf_figure:
+                if args.out is None:
+                    raise ValueError("--out is required for a PDF figure")
+                figure = pdf_figure(args.input, args.out)
+            else:
+                figure = None
+        if figure is not None:
+            json.dump(figure, sys.stdout)
+            sys.stdout.write("\n")
+            return 0
         with redirect_stdout(sys.stderr):
             deck, report = import_key(
                 args.input,

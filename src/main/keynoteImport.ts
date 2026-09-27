@@ -16,7 +16,7 @@ import type { ImportReport, PresentationImportResult } from '@shared/ipc.js';
  */
 
 /** Locate the sidecar: frozen binary when packaged, source script in dev. */
-function resolveSidecar(): { command: string; args: string[] } | null {
+export function resolveKeynoteSidecar(): { command: string; args: string[] } | null {
   const binaryName = process.platform === 'win32' ? 'keynote-import.exe' : 'keynote-import';
   const packaged = [
     join(process.resourcesPath ?? '', 'importers', binaryName),
@@ -46,7 +46,7 @@ export async function importKeynote(
   outDir: string,
   onProgress?: (message: string, ratio: number | null) => void,
 ): Promise<PresentationImportResult> {
-  const sidecar = resolveSidecar();
+  const sidecar = resolveKeynoteSidecar();
   if (!sidecar) {
     throw new Error(
       'Keynote importer not found. In development, create the venv:\n' +

@@ -163,6 +163,8 @@ DeckWerk is particularly suited to:
 
 DeckWerk presentations are stored locally as folders containing the presentation and its media. Videos remain ordinary video files and images remain ordinary image files.
 
+Drag a PDF onto a slide to insert its first page as a resizable figure. DeckWerk converts it to SVG, preserving vector artwork and font outlines, and keeps the original PDF in the deck's assets. The figure uses the same crop, border, presentation, and export controls as other images. In a development checkout, run `npm run setup:importer` once to install the converter dependencies.
+
 A talk does not need to be uploaded to a service before it can be edited, presented, shared, or archived.
 
 DeckWerk can also export a presentation for playback in a web browser, providing a portable fallback when presenting from another machine.
