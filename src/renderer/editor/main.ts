@@ -32,6 +32,7 @@ import { createToolbarPicker, createToolbarSplitButton } from './exportPicker.js
 import { showPdfExportDialog } from './pdfExportDialog.js';
 import { showWebExportDialog } from './webExportDialog.js';
 import { makePanelResizable } from './panelResize.js';
+import { createSidebarToggle } from './sidebarToggle.js';
 import { DelayedOperationProgress, type OperationHandle } from './operationProgress.js';
 import { DesignWorkspace } from './designWorkspace.js';
 import { persistSessionDeck } from './sessionPersistence.js';
@@ -497,6 +498,7 @@ function buildToolbar(): void {
   );
 
   bar.append(left, mid, right);
+  right.appendChild(createSidebarToggle(el('body'), el('side')));
   syncDeckNameLabel();
   installResponsiveToolbar(bar);
 }

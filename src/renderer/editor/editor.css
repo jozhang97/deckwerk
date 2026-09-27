@@ -208,6 +208,9 @@ body.welcome-mode .deck-only { display: none; }
   border-left: 1px solid var(--line);
 }
 
+#body.sidebar-collapsed > #side,
+#body.sidebar-collapsed > .panel-resize-side { display: none; }
+
 .panel-resize-handle {
   position: absolute;
   z-index: 50;

@@ -33,6 +33,7 @@ import {
   type ShellDeps,
 } from '../editor/shellWiring.js';
 import { SlideRail } from '../editor/slideRail.js';
+import { createSidebarToggle } from '../editor/sidebarToggle.js';
 import { EditorStore } from '../editor/store.js';
 import { createThemePanel } from '../editor/themePanel.js';
 import { TimelinePanel } from '../editor/timelinePanel.js';
@@ -794,6 +795,7 @@ function buildToolbar(): void {
   );
 
   bar.append(left, mid, right);
+  right.appendChild(createSidebarToggle(el('body'), el('side')));
   installResponsiveToolbar(bar);
 }
 

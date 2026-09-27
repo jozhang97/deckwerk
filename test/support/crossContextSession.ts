@@ -323,6 +323,12 @@ function buildSession(cdp: Cdp): CrossSession {
       }
       await cdp.evaluate(`(() => {
         window.store.commit((deck) => {
+          // Each walk starts with the complete visible, flat fixture. Undo
+          // in the previous walk may have restored hidden/grouped slides.
+          for (const slide of deck.slides) {
+            delete slide.skipped;
+            delete slide.depth;
+          }
           deck.slides[0].elements = ${JSON.stringify(startingElements())};
           deck.slides[1].elements = ${JSON.stringify([secondSlideElement()])};
         }, { label: 'Cross-context fixture' });

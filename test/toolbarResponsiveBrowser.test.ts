@@ -17,6 +17,29 @@ interface ToolbarLayout {
 
 let editor: DesktopEditor | null = null;
 
+describe.skipIf(!electronBinary)('right sidebar toggle in the desktop editor', () => {
+  it('expands the canvas, persists across reload, and restores the chosen panel and width', async () => {
+    editor = await launchDesktopEditor('sidebar-text', '<p>Sidebar toggle</p>');
+    const cdp = editor.cdp;
+    await cdp.click('#side-tabs [data-panel="history"]', 'History tab');
+    const width = () => cdp.evaluate<number>('document.getElementById("canvas").getBoundingClientRect().width');
+    const initialWidth = await width();
+    const sidebarWidth = await cdp.evaluate<number>('document.getElementById("side").getBoundingClientRect().width');
+    await cdp.click('.sidebar-toggle', 'Hide right sidebar');
+    expect(await width()).toBeCloseTo(initialWidth + sidebarWidth, 0);
+    expect(await cdp.evaluate<string>('getComputedStyle(document.querySelector(".panel-resize-side")).display')).toBe('none');
+    await cdp.click('.sidebar-toggle', 'Show right sidebar');
+    expect(await width()).toBe(initialWidth);
+    expect(await cdp.evaluate<boolean>('document.getElementById("history").hidden')).toBe(false);
+    await cdp.click('.sidebar-toggle', 'Hide before reload');
+    await cdp.call('Page.reload');
+    await eventually(() => cdp.evaluate<boolean>('!!document.querySelector(".sidebar-toggle")'), 'toolbar did not return');
+    expect(await cdp.evaluate<string>('getComputedStyle(document.getElementById("side")).display')).toBe('none');
+    await cdp.click('.sidebar-toggle', 'Restore after reload');
+    expect(await cdp.evaluate<number>('document.getElementById("side").getBoundingClientRect().width')).toBe(sidebarWidth);
+  }, 120_000);
+});
+
 afterEach(async () => {
   await editor?.close();
   editor = null;

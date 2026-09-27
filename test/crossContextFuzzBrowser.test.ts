@@ -138,7 +138,7 @@ type OpName =
   | 'click' | 'shift-click' | 'double-click text' | 'double-click image then text'
   | 'type nonce' | 'bold mid-word' | 'escape' | 'click empty' | 'marquee'
   | 'rail hop' | 'rail indent' | 'rail group' | 'undo' | 'redo' | 'undo round-trip' | 'delete selection'
-  | 'cmd+a';
+  | 'cmd+a' | 'sidebar toggle';
 
 interface Violation { seed: number; step: number; op: OpName; oracle: string; detail: string }
 
@@ -284,9 +284,6 @@ describe.skipIf(!electronBinary)('slide hierarchy keyboard interaction', () => {
     await session.reset();
     const before = await session.deckSnapshot();
     await session.clickRail(1);
-    // The shared session resets elements, but deliberately retains slide
-    // metadata from earlier walks. Start this geometry check at the root.
-    await session.chord('Tab', 'Tab', 9, 8);
     const beforeBox = await session.boxOf('.rail-item[data-index="1"] .rail-thumb');
     await session.key('Tab', 9);
     const depth = () => session.cdp.evaluate<number>('window.store.get().deck.slides[1].depth ?? 0');
@@ -437,6 +434,7 @@ function chooseOp(next: () => number, pre: CrossState): OpName {
   add('rail hop', 2);
   add('rail indent', 1);
   add('rail group', 1);
+  add('sidebar toggle', 1);
   add('undo', 2);
   add('redo', 1);
   add('undo round-trip', 1);
@@ -459,6 +457,13 @@ async function performOp(
 ): Promise<'same' | 'resync' | string[]> {
   const targets = targetsOn(pre);
   switch (op) {
+    case 'sidebar toggle': {
+      await session.cdp.click('.sidebar-toggle', 'hide sidebar');
+      expect(await session.cdp.evaluate<string>('getComputedStyle(document.getElementById("side")).display')).toBe('none');
+      await session.cdp.click('.sidebar-toggle', 'show sidebar');
+      expect(await session.cdp.evaluate<string>('getComputedStyle(document.getElementById("side")).display')).not.toBe('none');
+      return 'same';
+    }
     case 'click':
       await session.click(pick(next, targets));
       return 'same';

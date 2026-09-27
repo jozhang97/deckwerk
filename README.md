@@ -169,6 +169,8 @@ Organize the slide list into a hierarchy by selecting thumbnails and pressing Ta
 
 Click the arrow beside a parent slide to collapse or expand its group in the sidebar (Left/Right arrows do the same when the parent is selected). Collapse is local to the current editor session and does not affect playback. Select a parent and choose Hide group or Show group to skip or restore it and all its nested slides during presentation; this is saved with the deck and supports undo.
 
+Use the sidebar icon beside Present to hide or show the right panel (Props, Design, Build, and History). The canvas expands into the available space, and the editor remembers your visibility preference without changing the sidebar's saved width.
+
 A talk does not need to be uploaded to a service before it can be edited, presented, shared, or archived.
 
 DeckWerk can also export a presentation for playback in a web browser, providing a portable fallback when presenting from another machine.
