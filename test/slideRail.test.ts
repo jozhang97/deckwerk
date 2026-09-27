@@ -9,6 +9,7 @@ import { STOCK_STYLESHEET_STYLE, THEMES, adoptThemeStyles, fullThemeSelection } 
 import { defaultLayoutMasters, syncDeckWithLayoutMasters } from '../src/shared/layoutMasters.js';
 import { applySlideLayout } from '../src/renderer/editor/slideLayouts.js';
 import { PLAYER_TYPE_CSS } from '../src/shared/playerTypeCss.js';
+import { closePopover, openMenu } from '../src/renderer/editor/ui.js';
 
 /**
  * Rows select on pointerdown (a click never arrives when the browser turns a
@@ -50,6 +51,183 @@ function setup() {
   const rail = new SlideRail(host, store);
   return { store, host, rail };
 }
+
+describe('slide hierarchy', () => {
+  const tab = (host: HTMLElement, shiftKey = false) => host.dispatchEvent(
+    new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true }),
+  );
+
+  it('indents with Tab, persists the hierarchy, and supports outdent and undo/redo', () => {
+    const { host, store } = setup();
+    pickRow(host.querySelectorAll<HTMLElement>('.rail-item')[1]);
+    const thumb = host.querySelectorAll('.rail-thumb')[1];
+    expect(tab(host)).toBe(false);
+    expect(store.slide?.depth).toBe(1);
+    expect(parseDeck(JSON.parse(JSON.stringify(store.get().deck))).slides[1].depth).toBe(1);
+    expect(host.querySelector('[data-index="1"]')?.getAttribute('data-depth')).toBe('1');
+    expect(host.querySelectorAll('.rail-thumb')[1]).toBe(thumb);
+    expect(document.activeElement).toBe(host);
+    tab(host, true);
+    expect(store.slide?.depth ?? 0).toBe(0);
+    store.undo();
+    expect(store.slide?.depth).toBe(1);
+    store.redo();
+    expect(store.slide?.depth ?? 0).toBe(0);
+  });
+
+  it('refuses indentation without a parent and adds no empty undo entries', () => {
+    const { host, store } = setup();
+    const history = store.history().length;
+    tab(host);
+    tab(host, true);
+    expect(store.history()).toHaveLength(history);
+    store.selectSlide(1);
+    tab(host);
+    const indentedHistory = store.history().length;
+    tab(host);
+    expect(store.slide?.depth).toBe(1);
+    expect(store.history()).toHaveLength(indentedHistory);
+  });
+
+  it('keeps Tab navigation on the rail action buttons', () => {
+    const { host, store } = setup();
+    store.selectSlide(1);
+    const button = host.querySelector<HTMLButtonElement>('.rail-actions button')!;
+    expect(tab(button)).toBe(true);
+    expect(store.slide?.depth).toBeUndefined();
+  });
+
+  it('indents a selected range as siblings with one undo entry', () => {
+    const { host, store } = setup();
+    store.commit((deck) => {
+      deck.slides.push({ ...structuredClone(deck.slides[1]), id: 'slide-3' });
+    }, { history: false });
+    store.selectSlide(1);
+    store.selectSlide(2, true);
+    tab(host);
+    expect(store.get().deck.slides.map((slide) => slide.depth ?? 0)).toEqual([0, 1, 1]);
+    store.undo();
+    expect(store.get().deck.slides.map((slide) => slide.depth ?? 0)).toEqual([0, 0, 0]);
+  });
+
+  it('adds and duplicates siblings after existing descendants', () => {
+    const { store, rail } = setup();
+    store.selectSlide(1);
+    rail.indentSlides(1);
+    store.selectSlide(0);
+    rail.addSlide();
+    expect(store.get().slideIndex).toBe(2);
+    expect(store.get().deck.slides[1].id).toBe('slide-2');
+    store.selectSlide(0);
+    rail.duplicateSlide();
+    expect(store.get().slideIndex).toBe(2);
+    expect(store.get().deck.slides[1].depth).toBe(1);
+    expect(store.slide?.depth ?? 0).toBe(0);
+  });
+});
+
+describe('collapsing and hiding slide groups', () => {
+  function group() {
+    const fixture = setup();
+    fixture.store.commit((deck) => {
+      deck.slides[1].depth = 1;
+      deck.slides.push(
+        { ...structuredClone(deck.slides[1]), id: 'slide-3', depth: 2 },
+        { ...structuredClone(deck.slides[0]), id: 'slide-4' },
+      );
+    }, { history: false });
+    return fixture;
+  }
+  const disclosure = (host: HTMLElement, index = 0) =>
+    host.querySelector<HTMLElement>(`[data-index="${index}"] .rail-group-toggle`)!;
+  const visible = (host: HTMLElement) => [...host.querySelectorAll<HTMLElement>('[data-index]')]
+    .map((row) => Number(row.dataset.index));
+
+  it('folds a whole subtree without changing the deck or presentation visibility', () => {
+    const { host, store } = group();
+    const before = JSON.stringify(store.get().deck);
+    const history = store.history().length;
+    disclosure(host).click();
+    expect(visible(host)).toEqual([0, 3]);
+    expect(disclosure(host).getAttribute('aria-expanded')).toBe('false');
+    expect(JSON.stringify(store.get().deck)).toBe(before);
+    expect(store.history()).toHaveLength(history);
+    disclosure(host).click();
+    expect(visible(host)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('selects the parent when folding the active child and stays folded through edits', () => {
+    const { host, store } = group();
+    store.selectSlide(2);
+    disclosure(host).click();
+    expect(store.get().slideIndex).toBe(0);
+    expect(visible(host)).toEqual([0, 3]);
+    store.commit((deck) => { deck.slides[0].name = 'Edited parent'; });
+    expect(visible(host)).toEqual([0, 3]);
+    store.selectSlide(2);
+    expect(visible(host)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('remembers nested folds and skips collapsed children with the arrow keys', () => {
+    const { host, store } = group();
+    disclosure(host, 1).click();
+    disclosure(host).click();
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    expect(store.get().slideIndex).toBe(3);
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+    expect(store.get().slideIndex).toBe(0);
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    expect(visible(host)).toEqual([0, 1, 3]);
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+    expect(visible(host)).toEqual([0, 3]);
+  });
+
+  it('activates a focused disclosure with Enter without inserting a slide', () => {
+    const { host, store } = group();
+    const toggle = disclosure(host);
+    toggle.focus();
+    toggle.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    expect(visible(host)).toEqual([0, 3]);
+    expect(store.get().deck.slides).toHaveLength(4);
+    expect(document.activeElement).toBe(host);
+  });
+
+  it('hides and shows a collapsed group, leaving outside slides unchanged, with undo', () => {
+    const { host, store, rail } = group();
+    disclosure(host).click();
+    rail.toggleHidden();
+    expect(store.get().deck.slides.map((slide) => Boolean(slide.skipped))).toEqual([true, true, true, false]);
+    expect(visible(host)).toEqual([0, 3]);
+    expect(host.querySelector('.rail-toggle-hidden')?.textContent).toBe('Show group');
+    expect(disclosure(host)).not.toBeNull();
+    rail.toggleHidden();
+    expect(store.get().deck.slides.some((slide) => slide.skipped)).toBe(false);
+    store.undo();
+    expect(store.get().deck.slides.map((slide) => Boolean(slide.skipped))).toEqual([true, true, true, false]);
+    store.undo();
+    expect(store.get().deck.slides.some((slide) => slide.skipped)).toBe(false);
+  });
+
+  it('updates group controls when selection changes and when a parent loses its children', () => {
+    const { host, store } = group();
+    store.selectSlide(3);
+    expect(host.querySelector('.rail-toggle-hidden')?.textContent).toBe('Hide');
+    store.selectSlide(0);
+    expect(host.querySelector('.rail-toggle-hidden')?.textContent).toBe('Hide group');
+    store.commit((deck) => { deck.slides = deck.slides.filter((slide) => !slide.depth); });
+    expect(host.querySelector('.rail-group-toggle')).toBeNull();
+  });
+
+  it('keeps the disclosure state when an unrelated popover closes', () => {
+    const { host } = group();
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    openMenu(anchor, [{ label: 'Example', action: () => {} }]);
+    closePopover();
+    expect(anchor.getAttribute('aria-expanded')).toBe('false');
+    expect(disclosure(host).getAttribute('aria-expanded')).toBe('true');
+  });
+});
 
 describe('collaborator presence in the slide rail', () => {
   beforeEach(() => document.body.replaceChildren());

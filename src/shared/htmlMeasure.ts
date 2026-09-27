@@ -1623,6 +1623,7 @@ export function measureSlides(doc: Document): MeasuredSlide[] {
       notes: root.dataset.notes ?? '',
       background: { color: background, image: image ? image[1] : null },
       morphFromPrevious: root.dataset.morphFromPrevious === 'true',
+      ...(root.dataset.depth !== undefined ? { depth: Number(root.dataset.depth) } : {}),
       ...(root.dataset.morphDuration !== undefined
         ? { morphDuration: Number(root.dataset.morphDuration) }
         : {}),

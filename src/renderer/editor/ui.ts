@@ -28,6 +28,7 @@ export function menuButton(label: string, items: () => MenuItem[]): HTMLButtonEl
 }
 
 let activePopover: HTMLElement | null = null;
+let activePopoverAnchor: HTMLElement | null = null;
 let activeDismiss: ((event: Event) => void) | null = null;
 
 export function closePopover(): void {
@@ -35,12 +36,12 @@ export function closePopover(): void {
   activePopover = null;
   if (activeDismiss) document.removeEventListener('pointerdown', activeDismiss, true);
   activeDismiss = null;
-  for (const expanded of document.querySelectorAll<HTMLElement>('[aria-expanded="true"]')) {
-    expanded.setAttribute('aria-expanded', 'false');
-  }
+  activePopoverAnchor?.setAttribute('aria-expanded', 'false');
+  activePopoverAnchor = null;
 }
 
 function placePopover(popover: HTMLElement, anchor: HTMLElement): void {
+  activePopoverAnchor = anchor;
   document.body.appendChild(popover);
   const anchorRect = anchor.getBoundingClientRect();
   const rect = popover.getBoundingClientRect();

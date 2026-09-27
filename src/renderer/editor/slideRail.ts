@@ -8,6 +8,7 @@ import { LAYOUT_LABELS_BY_ID } from './layoutPreview.js';
 import { applySlideLayout } from './slideLayouts.js';
 import { newComment, openCommentsPopover, openCount } from './comments.js';
 import type { Deck, Slide } from '@shared/deck.js';
+import { changeSlideDepth, deleteSlidesPromotingChildren, moveSlideBranch, slideDepths, subtreeEnd } from '@shared/slideHierarchy.js';
 import { sameSlideIgnoringNotes, type EditorStore } from './store.js';
 
 /**
@@ -44,6 +45,9 @@ export class SlideRail {
   private highlightedSlideIndex = -1;
   private highlightedSelection = new Set<string>();
   private rowBySlideId = new Map<string, HTMLElement>();
+  private depths: number[] = [];
+  /** Outline folding is local view state, like expanded hidden-slide runs. */
+  private collapsedGroups = new Set<string>();
   /**
    * Row DOM cached per slide object and position, like `thumbCache`. A rebuild
    * keeps every row whose slide and index are unchanged attached exactly where
@@ -221,6 +225,8 @@ export class SlideRail {
     }
     this.highlightedSlideIndex = slideIndex;
     this.highlightedSelection = new Set(slideSelection);
+    const hide = this.host.querySelector<HTMLElement>('.rail-toggle-hidden');
+    if (hide) hide.textContent = this.hiddenActionLabel(slideIndex);
   }
 
   /** Show or hide the per-slide layout captions; the Design tab turns them on. */
@@ -231,6 +237,19 @@ export class SlideRail {
   render(): void {
     const { deck, slideIndex, slideSelection } = this.store.get();
     this.renderedSlides = deck.slides;
+    this.depths = slideDepths(deck.slides);
+    const ancestors: number[] = [];
+    for (let i = 0; i < deck.slides.length && i <= slideIndex; i += 1) {
+      while (ancestors.length && this.depths[ancestors[ancestors.length - 1]] >= this.depths[i]) ancestors.pop();
+      if (i === slideIndex) {
+        // Direct navigation to a folded child (search, undo, a collaborator)
+        // must reveal the active slide. Ordinary rail arrows skip folded rows.
+        for (const parent of ancestors) this.collapsedGroups.delete(deck.slides[parent].id);
+      }
+      ancestors.push(i);
+    }
+    const ids = new Set(deck.slides.map((slide) => slide.id));
+    for (const id of this.collapsedGroups) if (!ids.has(id)) this.collapsedGroups.delete(id);
     this.highlightedSlideIndex = slideIndex;
     this.highlightedSelection = new Set(slideSelection);
     this.thumbVisibilityObserver?.disconnect();
@@ -257,13 +276,21 @@ export class SlideRail {
     // unless expanded. A run holding the active slide normally stays expanded;
     // an explicit bracket click may hide that row while preserving the editor.
     for (let i = 0; i < deck.slides.length; ) {
+      // Hierarchical rows keep their parent visible even when the whole group
+      // is skipped, so Show group and its disclosure are always reachable.
+      if (this.depths[i] > 0 || this.hasChildren(i)) {
+        children.push(this.buildItem(deck, i, slideIndex, slideSelection));
+        i = this.collapsedGroups.has(deck.slides[i].id) ? subtreeEnd(this.depths, i) : i + 1;
+        continue;
+      }
       if (!deck.slides[i].skipped) {
         children.push(this.buildItem(deck, i, slideIndex, slideSelection));
         i += 1;
         continue;
       }
       let end = i;
-      while (end + 1 < deck.slides.length && deck.slides[end + 1].skipped) end += 1;
+      while (end + 1 < deck.slides.length && deck.slides[end + 1].skipped
+        && this.depths[end + 1] === 0 && !this.hasChildren(end + 1)) end += 1;
       if (end === i) {
         children.push(this.buildItem(deck, i, slideIndex, slideSelection));
         i += 1;
@@ -284,13 +311,12 @@ export class SlideRail {
 
     const actions = document.createElement('div');
     actions.className = 'rail-actions';
+    const hide = railButton(this.hiddenActionLabel(slideIndex), () => this.toggleHidden());
+    hide.classList.add('rail-toggle-hidden');
     actions.append(
       railButton('+ Slide', () => this.addSlide()),
       railButton('Duplicate', () => this.duplicateSlide()),
-      railButton(
-        deck.slides[slideIndex]?.skipped ? 'Show' : 'Hide',
-        () => this.toggleHidden(),
-      ),
+      hide,
       railButton('Delete', () => this.deleteSlide()),
     );
     children.push(actions);
@@ -318,14 +344,15 @@ export class SlideRail {
   }
 
   /**
-   * A speaker-note edit hands out a new slide object that draws the same
+   * A speaker-note or indentation edit hands out a new slide object that draws the same
    * picture. Move that slide's cached row and thumbnail over to the new object
    * so the rebuild treats it as unchanged.
    */
   private rekeyNoteOnlyChanges(deck: Deck): void {
     for (const slide of deck.slides) {
       const previous = this.slideById.get(slide.id);
-      if (previous && previous !== slide && sameSlideIgnoringNotes(previous, slide)) {
+      if (previous && previous !== slide
+        && sameSlideIgnoringNotes({ ...previous, depth: slide.depth }, slide)) {
         const thumb = this.thumbCache.get(previous);
         if (thumb) {
           this.thumbCache.delete(previous);
@@ -367,6 +394,7 @@ export class SlideRail {
       .slice(start, end + 1)
       .some((slide) => slideSelection.has(slide.id));
     row.className = `rail-item rail-collapsed${selected ? ' selected' : ''}`;
+    row.style.setProperty('--slide-depth', String(this.depths[start]));
     row.setAttribute('aria-selected', String(selected));
     row.title = `Show hidden slides ${start + 1}–${end + 1}`;
 
@@ -628,6 +656,8 @@ export class SlideRail {
       // store decides per render, and re-arm the visibility observer the
       // rebuild disconnected.
       const item = cached.row;
+      this.syncDepth(item, i);
+      this.syncGroup(item, i);
       this.rowBySlideId.set(slide.id, item);
       this.syncRowState(item, i === slideIndex, slideSelection.has(slide.id));
       const thumb = item.querySelector<HTMLElement>(':scope > .rail-thumb');
@@ -646,6 +676,7 @@ export class SlideRail {
       item.draggable = true;
       item.dataset.index = String(i);
       item.dataset.slideId = slide.id;
+      this.syncDepth(item, i);
       this.rowBySlideId.set(slide.id, item);
       this.bindReorder(item, i);
 
@@ -655,6 +686,7 @@ export class SlideRail {
 
       const thumb = this.deferredThumb(deck, slide, i === slideIndex);
       item.append(num, thumb);
+      this.syncGroup(item, i);
       // The slide's design facts, shown only while the Design tab is open
       // (see `setDesignLabels`): which layout it is on, and whether its
       // ground is its own rather than the theme's.
@@ -739,14 +771,19 @@ export class SlideRail {
     this.host.focus({ preventScroll: true });
 
     const hidden = Boolean(this.store.get().deck.slides[index]?.skipped);
+    const group = this.hasChildren(index);
     const items: Array<{ label: string; action: () => void } | 'separator'> = [
-      { label: hidden ? 'Show slide' : 'Hide slide', action: () => this.toggleHidden() },
+      { label: `${hidden ? 'Show' : 'Hide'} ${group ? 'group' : 'slide'}`, action: () => this.toggleHidden() },
       'separator',
       { label: 'Add slide below', action: () => this.addSlide() },
       { label: 'Duplicate', action: () => this.duplicateSlide() },
       'separator',
       { label: 'Delete', action: () => this.deleteSlide() },
     ];
+    if (group) items.unshift({
+      label: this.collapsedGroups.has(slide.id) ? 'Expand group' : 'Collapse group',
+      action: () => this.toggleGroup(index),
+    });
 
     const menu = document.createElement('div');
     menu.id = 'ctx-menu';
@@ -777,6 +814,23 @@ export class SlideRail {
   private bindKeys(): void {
     this.host.tabIndex = 0;
     this.host.addEventListener('keydown', (e) => {
+      if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        const { slideIndex, deck } = this.store.get();
+        if (!this.hasChildren(slideIndex)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const collapsed = this.collapsedGroups.has(deck.slides[slideIndex].id);
+        if ((e.key === 'ArrowLeft') !== collapsed) this.toggleGroup(slideIndex);
+        return;
+      }
+      if (e.key === 'Tab' && !e.altKey && !e.ctrlKey && !e.metaKey
+        && (e.target === this.host || (e.target as HTMLElement).matches('.rail-item[data-index]'))) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.indentSlides(e.shiftKey ? -1 : 1);
+        this.host.focus({ preventScroll: true });
+        return;
+      }
       if (e.key === 'Enter') {
         // Suppress the focused button's synthetic click: Return inserts once.
         e.preventDefault();
@@ -802,7 +856,8 @@ export class SlideRail {
       // to select a hidden slide.
       const step = e.key === 'ArrowDown' ? 1 : -1;
       let next = slideIndex + step;
-      while (next >= 0 && next < deck.slides.length && deck.slides[next].skipped) next += step;
+      while (next >= 0 && next < deck.slides.length
+        && (deck.slides[next].skipped || !this.rowBySlideId.has(deck.slides[next].id))) next += step;
       if (next < 0 || next >= deck.slides.length) return;
       this.store.selectSlide(next);
     });
@@ -887,17 +942,11 @@ export class SlideRail {
 
       const r = item.getBoundingClientRect();
       const after = e.clientY >= r.top + r.height / 2;
-      let to = after ? index + 1 : index;
-      // Removing the dragged slide first shifts every later index down by one.
-      if (from < to) to -= 1;
-
       this.dragFrom = null;
-      if (to === from) return;
-
+      let to = from;
       this.store.commit((deck) => {
-        const [moved] = deck.slides.splice(from, 1);
-        deck.slides.splice(to, 0, moved);
-      });
+        to = moveSlideBranch(deck.slides, from, index, after);
+      }, { label: 'Move slides' });
       this.store.selectSlide(to);
     });
   }
@@ -932,9 +981,12 @@ export class SlideRail {
   }
 
   addSlide(): void {
-    const at = this.store.get().slideIndex + 1;
+    const { deck, slideIndex } = this.store.get();
+    const depths = slideDepths(deck.slides);
+    const at = subtreeEnd(depths, slideIndex);
     this.store.commit((deck) => {
       const slide = blankSlide();
+      if (depths[slideIndex]) slide.depth = depths[slideIndex];
       deck.slides.splice(at, 0, slide);
       applySlideLayout(slide, 'standard', deck.layoutMasters);
       // Layout gives the slide its geometry; the deck's theme gives it its
@@ -945,11 +997,13 @@ export class SlideRail {
   }
 
   duplicateSlide(): void {
-    const { slideIndex } = this.store.get();
+    const { slideIndex, deck } = this.store.get();
+    const at = subtreeEnd(slideDepths(deck.slides), slideIndex);
     this.store.commit((deck) => {
       const source = deck.slides[slideIndex];
       if (!source) return;
       const copy = structuredClone(source);
+      copy.depth = slideDepths(deck.slides)[slideIndex];
       copy.id = makeId('slide');
       copy.name = source.name ? `${source.name} copy` : '';
       // Fresh ids, or the duplicate's timeline would drive the original's
@@ -975,9 +1029,9 @@ export class SlideRail {
           entry.trigger.ref = remap.get(entry.trigger.ref) ?? entry.trigger.ref;
         }
       }
-      deck.slides.splice(slideIndex + 1, 0, copy);
+      deck.slides.splice(at, 0, copy);
     });
-    this.store.selectSlide(slideIndex + 1);
+    this.store.selectSlide(at);
   }
 
   /**
@@ -996,11 +1050,18 @@ export class SlideRail {
       deck.slides.filter((s) => slideSelection.has(s.id)).map((s) => s.id),
     );
     if (ids.size === 0) ids.add(current.id);
+    const depths = slideDepths(deck.slides);
+    for (let index = 0; index < deck.slides.length; index += 1) {
+      if (!ids.has(deck.slides[index].id)) continue;
+      const end = subtreeEnd(depths, index);
+      for (let child = index + 1; child < end; child += 1) ids.add(deck.slides[child].id);
+      index = end - 1;
+    }
     this.store.commit((d) => {
       for (const slide of d.slides) {
         if (ids.has(slide.id)) slide.skipped = hide ? true : undefined;
       }
-    }, { label: hide ? 'Hide slide' : 'Show slide' });
+    }, { label: `${hide ? 'Hide' : 'Show'} ${ids.size > 1 ? 'slides' : 'slide'}` });
   }
 
   /**
@@ -1030,7 +1091,7 @@ export class SlideRail {
     if (survivor) ids.delete(survivor);
     const first = Math.min(...doomed.map(({ index }) => index), slideIndex);
     this.store.commit((d) => {
-      d.slides = d.slides.filter((slide) => !ids.has(slide.id));
+      d.slides = deleteSlidesPromotingChildren(d.slides, ids);
       if (!survivor) return;
       const kept = { ...blankSlide(), id: survivor };
       d.slides[0] = kept;
@@ -1038,6 +1099,87 @@ export class SlideRail {
       applyDeckThemeToNewSlide(d, 0);
     }, { label: doomed.length === 1 ? 'Delete slide' : `Delete ${doomed.length} slides` });
     this.store.selectSlide(wholeDeck ? 0 : Math.max(0, first - 1));
+  }
+
+  private syncDepth(item: HTMLElement, index: number): void {
+    const depth = this.depths[index] ?? 0;
+    item.style.setProperty('--slide-depth', String(depth));
+    item.dataset.depth = String(depth);
+    item.setAttribute('aria-label', `Slide ${index + 1}, level ${depth + 1}`);
+    item.title = 'Tab: indent slide · Shift+Tab: outdent slide';
+  }
+
+  private hasChildren(index: number): boolean {
+    return index + 1 < this.depths.length && this.depths[index + 1] > this.depths[index];
+  }
+
+  private hiddenActionLabel(index: number): string {
+    return (this.store.get().deck.slides[index]?.skipped ? 'Show' : 'Hide')
+      + (this.hasChildren(index) ? ' group' : '');
+  }
+
+  private syncGroup(item: HTMLElement, index: number): void {
+    let toggle = item.querySelector<HTMLElement>('.rail-group-toggle');
+    if (!this.hasChildren(index)) {
+      toggle?.remove();
+      return;
+    }
+    if (!toggle) {
+      // Rows are buttons already; use the same nested span control pattern as
+      // the rail's comment affordance, with explicit keyboard activation.
+      toggle = document.createElement('span');
+      toggle.className = 'rail-group-toggle';
+      toggle.setAttribute('role', 'button');
+      toggle.tabIndex = 0;
+      toggle.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      toggle.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.toggleGroup(index);
+      });
+      toggle.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.toggleGroup(index);
+      });
+      item.querySelector('.rail-num')!.appendChild(toggle);
+    }
+    const slide = this.store.get().deck.slides[index];
+    const collapsed = this.collapsedGroups.has(slide.id);
+    const count = subtreeEnd(this.depths, index) - index - 1;
+    toggle.textContent = collapsed ? '▸' : '▾';
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+    toggle.title = `${collapsed ? 'Expand' : 'Collapse'} group (${count} nested slide${count === 1 ? '' : 's'})`;
+    toggle.setAttribute('aria-label', toggle.title);
+  }
+
+  private toggleGroup(index: number): void {
+    if (!this.hasChildren(index)) return;
+    const { deck, slideIndex, slideSelection } = this.store.get();
+    const id = deck.slides[index].id;
+    if (this.collapsedGroups.has(id)) this.collapsedGroups.delete(id);
+    else {
+      this.collapsedGroups.add(id);
+      const end = subtreeEnd(this.depths, index);
+      // Do not leave an active or selected child invisible behind its parent.
+      if ((slideIndex > index && slideIndex < end)
+        || deck.slides.slice(index + 1, end).some((slide) => slideSelection.has(slide.id))) {
+        this.store.selectSlide(index);
+      }
+    }
+    this.render();
+    this.host.focus({ preventScroll: true });
+  }
+
+  indentSlides(delta: 1 | -1): void {
+    const { slideSelection } = this.store.get();
+    this.store.commit((deck) => changeSlideDepth(deck.slides, slideSelection, delta), {
+      label: delta === 1 ? 'Indent slides' : 'Outdent slides',
+    });
   }
 }
 

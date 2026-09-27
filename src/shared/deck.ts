@@ -386,6 +386,8 @@ export const SlideSchema = z.object({
   morphDuration: z.number().min(100).max(5000).optional(),
   /** Kept in the deck and editable, but stepped over when presenting. */
   skipped: z.boolean().optional(),
+  /** Indentation in the editor's slide outline; does not change playback. */
+  depth: z.number().int().nonnegative().optional(),
   elements: z.array(ElementSchema).default([]),
   timeline: z.array(TimelineEntrySchema).default([]),
   /** Discussion attached to the slide as a whole; absent when there is none. */

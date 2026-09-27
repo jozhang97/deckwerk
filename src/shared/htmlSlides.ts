@@ -71,6 +71,7 @@ export interface MeasuredSlide {
   background: { color: string | null; image: string | null };
   morphFromPrevious: boolean;
   morphDuration?: number;
+  depth?: number;
   nodes: MeasuredNode[];
   /**
    * Inline style the browser silently refused: a segment with no colon, or a
@@ -701,6 +702,7 @@ export function slideFromMeasured(
     background: measured.background,
     ...(measured.morphFromPrevious ? { morphFromPrevious: true } : {}),
     ...(measured.morphDuration !== undefined ? { morphDuration: measured.morphDuration } : {}),
+    ...(measured.depth !== undefined ? { depth: measured.depth } : {}),
     elements,
     timeline,
   };
@@ -982,6 +984,7 @@ export function slideToHtml(slide: Slide, canvas: { w: number; h: number }): str
   return `<section class="slide" data-slide-id="${escape(slide.id)}"`
     + ` data-canvas="${canvas.w}x${canvas.h}"`
     + (slide.name ? ` data-name="${escape(slide.name)}"` : '')
+    + (slide.depth ? ` data-depth="${slide.depth}"` : '')
     + (slide.morphFromPrevious ? ' data-morph-from-previous="true"' : '')
     + (slide.morphDuration !== undefined ? ` data-morph-duration="${slide.morphDuration}"` : '')
     + `${background}>\n${body}\n</section>\n`;

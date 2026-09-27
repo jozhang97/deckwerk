@@ -137,7 +137,7 @@ function isKnownStaleSlideIdentity(error: string): boolean {
 type OpName =
   | 'click' | 'shift-click' | 'double-click text' | 'double-click image then text'
   | 'type nonce' | 'bold mid-word' | 'escape' | 'click empty' | 'marquee'
-  | 'rail hop' | 'undo' | 'redo' | 'undo round-trip' | 'delete selection'
+  | 'rail hop' | 'rail indent' | 'rail group' | 'undo' | 'redo' | 'undo round-trip' | 'delete selection'
   | 'cmd+a';
 
 interface Violation { seed: number; step: number; op: OpName; oracle: string; detail: string }
@@ -252,6 +252,58 @@ describe.skipIf(!electronBinary)('cross-context fuzz over three elements and two
       violations,
       violations.map((v) => `[${v.oracle}] ${v.detail}`).join('\n\n'),
     ).toEqual([]);
+  });
+});
+
+describe.skipIf(!electronBinary)('slide hierarchy keyboard interaction', () => {
+  it('collapses a group with its disclosure and hides or shows all nested slides', async () => {
+    await session.reset();
+    await session.clickRail(1);
+    await session.key('Tab', 9);
+    await session.clickRail(0);
+    const childVisible = () => session.cdp.evaluate<boolean>(
+      '!!document.querySelector(".rail-item[data-index=\\"1\\"]")',
+    );
+    const skipped = () => session.cdp.evaluate<boolean[]>(
+      'window.store.get().deck.slides.map(slide => !!slide.skipped)',
+    );
+    await session.cdp.click('.rail-group-toggle', 'collapse group');
+    expect(await childVisible()).toBe(false);
+    expect(await skipped()).toEqual([false, false]);
+    await session.cdp.click('.rail-toggle-hidden', 'hide group');
+    expect(await skipped()).toEqual([true, true]);
+    expect(await childVisible()).toBe(false);
+    await session.cdp.click('.rail-toggle-hidden', 'show group');
+    expect(await skipped()).toEqual([false, false]);
+    await session.cdp.click('.rail-group-toggle', 'expand group');
+    expect(await childVisible()).toBe(true);
+    expect(await session.problems()).toEqual([]);
+  });
+
+  it('indents a picked thumbnail, outdents it, and undoes without editing the slide content', async () => {
+    await session.reset();
+    const before = await session.deckSnapshot();
+    await session.clickRail(1);
+    // The shared session resets elements, but deliberately retains slide
+    // metadata from earlier walks. Start this geometry check at the root.
+    await session.chord('Tab', 'Tab', 9, 8);
+    const beforeBox = await session.boxOf('.rail-item[data-index="1"] .rail-thumb');
+    await session.key('Tab', 9);
+    const depth = () => session.cdp.evaluate<number>('window.store.get().deck.slides[1].depth ?? 0');
+    expect(await depth()).toBe(1);
+    const afterBox = await session.boxOf('.rail-item[data-index="1"] .rail-thumb');
+    expect(afterBox.left - beforeBox.left).toBeCloseTo(16, 0);
+    expect(afterBox.width).toBeLessThan(beforeBox.width);
+    expect(afterBox.width).toBeGreaterThan(80);
+    expect(await session.cdp.evaluate<string>('document.activeElement.id')).toBe('rail');
+    await session.chord('Tab', 'Tab', 9, 8);
+    expect(await depth()).toBe(0);
+    await session.chord('z', 'KeyZ', 90, MOD);
+    expect(await depth()).toBe(1);
+    await session.chord('z', 'KeyZ', 90, MOD | 8);
+    expect(await depth()).toBe(0);
+    expect(await session.deckSnapshot()).toBe(before);
+    expect(await session.problems()).toEqual([]);
   });
 });
 
@@ -383,6 +435,8 @@ function chooseOp(next: () => number, pre: CrossState): OpName {
   add('click empty', 1);
   add('marquee', 1);
   add('rail hop', 2);
+  add('rail indent', 1);
+  add('rail group', 1);
   add('undo', 2);
   add('redo', 1);
   add('undo round-trip', 1);
@@ -463,6 +517,33 @@ async function performOp(
       const other = pre.slideIndex === 0 ? 1 : 0;
       await session.clickRail(other);
       if (next() < 0.6) await session.clickRail(pre.slideIndex);
+      return 'same';
+    }
+    case 'rail group': {
+      await session.clickRail(1);
+      await session.key('Tab', 9);
+      await session.clickRail(0);
+      if (next() < 0.5) {
+        await session.cdp.click('.rail-group-toggle', 'collapse group');
+        expect(await session.cdp.evaluate<number>('document.querySelectorAll(".rail-item[data-index]").length')).toBe(1);
+        await session.cdp.click('.rail-group-toggle', 'expand group');
+      } else {
+        const before = await session.cdp.evaluate<boolean>('!!window.store.get().deck.slides[0].skipped');
+        await session.cdp.click('.rail-toggle-hidden', 'toggle group visibility');
+        expect(await session.cdp.evaluate<boolean[]>('window.store.get().deck.slides.map(slide => !!slide.skipped)'))
+          .toEqual([!before, !before]);
+        await session.cdp.click('.rail-toggle-hidden', 'restore group visibility');
+      }
+      return 'same';
+    }
+    case 'rail indent': {
+      await session.clickRail(1);
+      const outdent = next() < 0.5;
+      await session.chord('Tab', 'Tab', 9, outdent ? 8 : 0);
+      const depths = await session.cdp.evaluate<number[]>(
+        'window.store.get().deck.slides.map(slide => slide.depth ?? 0)',
+      );
+      expect(depths).toEqual([0, outdent ? 0 : 1]);
       return 'same';
     }
     case 'undo':

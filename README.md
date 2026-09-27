@@ -165,6 +165,10 @@ DeckWerk presentations are stored locally as folders containing the presentation
 
 Drag a PDF onto a slide to insert its first page as a resizable figure. DeckWerk converts it to SVG, preserving vector artwork and font outlines, and keeps the original PDF in the deck's assets. The figure uses the same crop, border, presentation, and export controls as other images. In a development checkout, run `npm run setup:importer` once to install the converter dependencies.
 
+Organize the slide list into a hierarchy by selecting thumbnails and pressing Tab to indent or Shift+Tab to outdent. Indenting a parent or dragging it to a new position carries its nested slides. The hierarchy is saved with the deck and supports undo/redo; indentation does not change presentation order.
+
+Click the arrow beside a parent slide to collapse or expand its group in the sidebar (Left/Right arrows do the same when the parent is selected). Collapse is local to the current editor session and does not affect playback. Select a parent and choose Hide group or Show group to skip or restore it and all its nested slides during presentation; this is saved with the deck and supports undo.
+
 A talk does not need to be uploaded to a service before it can be edited, presented, shared, or archived.
 
 DeckWerk can also export a presentation for playback in a web browser, providing a portable fallback when presenting from another machine.

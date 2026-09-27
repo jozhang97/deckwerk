@@ -53,6 +53,14 @@ function pageFrame(body: string): Document {
 }
 
 describe('the authoring page', () => {
+  it('preserves slide hierarchy through HTML export and compilation', () => {
+    const deck = emptyDeck();
+    deck.slides[0].depth = 2;
+    const html = slidesToHtml(deck.slides, deck.canvas);
+    const measured = measureSlides(pageFrame(html));
+    expect(measured[0].depth).toBe(2);
+    expect(slidesFromMeasured(deck, measured)[0].depth).toBe(2);
+  });
   it('declares the deck as its base so assets resolve as the player resolves them', () => {
     const doc = pageDocument('<section class="slide" data-slide-id="a"></section>');
     expect(doc.querySelector('base')?.getAttribute('href')).toBe('deck://asset/');

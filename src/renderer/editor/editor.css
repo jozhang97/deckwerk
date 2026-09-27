@@ -1988,6 +1988,8 @@ button.primary:hover:not(:disabled) { background: rgb(122 162 247 / 22%); }
 .rail-item {
   margin: 0 8px 4px;
   padding: 4px;
+  /* Preserve enough room for the preview even in a deeply nested outline. */
+  padding-left: calc(4px + min(var(--slide-depth, 0) * 16px, 50%));
   border: 1px solid transparent;
   background: transparent;
 }
@@ -1998,6 +2000,24 @@ button.primary:hover:not(:disabled) { background: rgb(122 162 247 / 22%); }
 .rail-num { font: 10px var(--mono); color: var(--muted); }
 .rail-item.selected .rail-num { color: var(--accent); }
 .rail-item.active .rail-num { color: var(--accent); }
+
+.rail-num:has(.rail-group-toggle) { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.rail-group-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--muted);
+  background: transparent;
+  font: 14px var(--mono);
+  cursor: pointer;
+}
+.rail-group-toggle:hover { background: var(--panel-2); border-color: var(--line); color: var(--accent); }
+.rail-group-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.rail-group-toggle[aria-expanded="true"] { color: var(--accent); }
 
 .rail-thumb {
   --rail-thumb-stroke: var(--line);
