@@ -2437,7 +2437,9 @@ export class EditorCanvas {
           // A circular mask is square by construction; a free resize would
           // stretch it back into the ellipse this is meant to avoid.
           (resizing.maskShape === 'circle' ||
-            (resizing.fit !== 'fill' && !resizing.sourceBox));
+            // Cropped pictures still resize proportionally. Only editing the
+            // crop window itself should bypass the media's aspect lock.
+            (resizing.fit !== 'fill' && this.maskingId !== drag.elementId));
         const constrained = ev.shiftKey || keepAspect;
         if (constrained) rect = constrainAspect(rect, o, edges, drag.aspect);
 
