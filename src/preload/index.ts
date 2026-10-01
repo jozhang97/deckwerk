@@ -62,6 +62,11 @@ ipcRenderer.on(IPC.deckKey, (_e, key: string) => {
  * nodeIntegration is off, so this surface is deliberately small and explicit.
  */
 const api = {
+  openWebsite: (): Promise<void> => ipcRenderer.invoke(IPC.websiteOpen),
+  importHtmlFile: (file: File, operationId: string): Promise<{ src: string; poster: null; title: string } | null> =>
+    ipcRenderer.invoke(IPC.htmlImport, operationId, webUtils.getPathForFile(file)),
+  importHtml: (operationId: string): Promise<{ src: string; poster: null; title: string } | null> =>
+    ipcRenderer.invoke(IPC.htmlImport, operationId),
   importPymolFile: (file: File, operationId: string): Promise<ImportedPymol | null> =>
     ipcRenderer.invoke(IPC.pymolImport, operationId, webUtils.getPathForFile(file)),
   importPymol: (operationId: string): Promise<ImportedPymol | null> =>

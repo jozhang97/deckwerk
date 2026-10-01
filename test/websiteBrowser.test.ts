@@ -1,0 +1,108 @@
+import type { ChildProcess } from 'node:child_process';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { createServer, type Server } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, expect, it } from 'vitest';
+import { emptyDeck } from '../src/shared/deck.js';
+import { saveDeck } from '../src/main/deckStore.js';
+import { Cdp, eventually, findTarget, stopBrowser, wait } from './support/browserSession.js';
+import { isEditorTarget, launchDesktopApp, materializeDesktopApp } from './support/desktopApp.js';
+let work = '';
+let child: ChildProcess | null = null;
+let server: Server | null = null;
+const clients: Cdp[] = [];
+afterEach(async () => {
+  clients.splice(0).forEach(c => c.close());
+  await stopBrowser(child);
+  if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
+  if (work) await rm(work, { recursive: true, force: true });
+});
+it('imports interactive HTML and browses websites that refuse frames with isolated navigation', { timeout: 120_000 }, async () => {
+  work = await mkdtemp(join(tmpdir(), 'deckwerk-web-import-'));
+  const deckDir = join(work, 'deck');
+  const profileDir = join(work, 'profile');
+  const appDir = join(work, 'app');
+  await mkdir(profileDir);
+  await saveDeck(deckDir, emptyDeck('Web import'));
+  await writeFile(join(deckDir, 'theme.css'), '.slide { background:white }');
+  const html = join(work, 'page.html');
+  await writeFile(html, '<!doctype html><html><body><button onclick="this.textContent=\'clicked\'">Click</button></body></html>');
+  const dialogs = join(work, 'dialogs.json');
+  await writeFile(dialogs, JSON.stringify([{ canceled: true }, { filePaths: [html] }]));
+  await materializeDesktopApp(appDir, 'deckwerk-website-test');
+  const app = await launchDesktopApp(appDir, [deckDir], { profileDir, env: { DECKWERK_TEST_DIALOGS: dialogs } });
+  child = app.process;
+  const target = await findTarget(app.debugPort, isEditorTarget, app.log);
+  const editor = await Cdp.connect(target.webSocketDebuggerUrl!); clients.push(editor);
+  await eventually(() => editor.evaluate(`Boolean(document.querySelector('#canvas .slide'))`), 'Web toolbar');
+  await wait(4000);
+  async function importHtml(): Promise<void> {
+    await editor.evaluate(`[...document.querySelectorAll('.toolbar-expanded-file-actions button')].find(b => b.textContent === 'Import…').click()`);
+    await editor.evaluate(`[...document.querySelectorAll('button')].find(b => b.textContent === 'HTML page…').click()`);
+  }
+  await importHtml();
+  await wait(300);
+  expect(await editor.evaluate(`document.querySelectorAll('#canvas iframe.web-frame').length`)).toBe(0);
+  await importHtml();
+  await eventually(() => editor.evaluate(`Boolean(document.querySelector('#canvas iframe.web-frame'))`), 'imported frame');
+  expect(await editor.evaluate(`document.querySelector('#canvas iframe.web-frame').getAttribute('sandbox')`)).toBe('allow-scripts');
+  const modifier = globalThis.process.platform === 'darwin' ? 4 : 2;
+  await editor.chord('z', 'KeyZ', 90, modifier);
+  await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas iframe.web-frame').length === 0`), 'undo HTML import');
+  await editor.chord('z', 'KeyZ', 90, modifier | 8);
+  await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas iframe.web-frame').length === 1`), 'redo HTML import');
+  const droppedHtml = join(work, 'dropped.HTM');
+  const droppedXhtml = join(work, 'second.xhtml');
+  await writeFile(droppedHtml, '<html><body>First dropped page</body></html>');
+  await writeFile(droppedXhtml, '<html><body>Second dropped page</body></html>');
+  const dropPoint = await editor.evaluate<{ x: number; y: number }>(`(() => {
+    const box = document.querySelector('#canvas .slide').getBoundingClientRect();
+    return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+  })()`);
+  for (const type of ['dragEnter', 'dragOver', 'drop']) {
+    await editor.call('Input.dispatchDragEvent', { type, ...dropPoint,
+      data: { items: [], files: [droppedHtml, droppedXhtml], dragOperationsMask: 1 } });
+  }
+  await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas iframe.web-frame').length === 3`), 'multiple HTML files imported from native drop');
+  expect(await editor.evaluate(`document.getElementById('status').textContent`)).toContain('Imported second');
+  expect(await editor.evaluate(`document.getElementById('status').dataset.busy`)).toBe('false');
+  await editor.chord('z', 'KeyZ', 90, modifier);
+  await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas iframe.web-frame').length === 2`), 'undo second dropped page');
+  await editor.chord('z', 'KeyZ', 90, modifier);
+  await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas iframe.web-frame').length === 1`), 'undo first dropped page');
+  const webId = await editor.evaluate<string>(`document.querySelector('#canvas iframe.web-frame').closest('[data-element-id]').dataset.elementId`);
+  await editor.doubleClick(`#canvas [data-element-id="${webId}"]`);
+  const pageTarget = await findTarget(app.debugPort, t => t.url.includes('/assets/web/page.') && t.url.endsWith('.html'), app.log);
+  const page = await Cdp.connect(pageTarget.webSocketDebuggerUrl!); clients.push(page);
+  await page.evaluate(`document.querySelector('button').click()`);
+  expect(await page.evaluate(`document.querySelector('button').textContent`)).toBe('clicked');
+  server = createServer((req, res) => {
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Type', 'text/html');
+    res.end(`<title>Website fixture</title><a href="/next">Next</a><p>${req.url}</p>`);
+  });
+  await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  const url = `http://127.0.0.1:${port}/`;
+  await editor.evaluate(`window.api.openWebsite()`);
+  const browserTarget = await findTarget(app.debugPort, t => t.url.includes('/browser/index.html'), app.log);
+  const browser = await Cdp.connect(browserTarget.webSocketDebuggerUrl!); clients.push(browser);
+  await eventually(() => browser.evaluate(`Boolean(window.website)`), 'browser toolbar ready');
+  await browser.evaluate(`window.website.command('navigate', ${JSON.stringify(url)})`);
+  const remoteTarget = await findTarget(app.debugPort, t => t.url === url, app.log);
+  const remote = await Cdp.connect(remoteTarget.webSocketDebuggerUrl!); clients.push(remote);
+  await eventually(() => remote.evaluate(`document.querySelector('p')?.textContent === '/'`), 'website loaded');
+  expect(await remote.evaluate(`typeof window.api + '/' + typeof require + '/' + typeof window.website`)).toBe('undefined/undefined/undefined');
+  await remote.evaluate(`document.querySelector('a').click()`);
+  await eventually(() => browser.evaluate(`!document.querySelector('#back').disabled`), 'back enabled');
+  await browser.evaluate(`window.website.command('back')`);
+  await eventually(() => remote.evaluate(`location.pathname === '/'`), 'back navigation');
+  await browser.evaluate(`window.website.command('forward')`);
+  await eventually(() => remote.evaluate(`location.pathname === '/next'`), 'forward navigation');
+  await browser.evaluate(`window.website.command('navigate', 'file:///etc/passwd')`);
+  await eventually(() => browser.evaluate(`document.querySelector('#status').textContent.includes('HTTP')`), 'invalid address error');
+  expect(await remote.evaluate(`location.pathname`)).toBe('/next');
+  const shot = await browser.call('Page.captureScreenshot', { format: 'png' }) as { data: string };
+  await writeFile(join(tmpdir(), 'deckwerk-website-toolbar.png'), Buffer.from(shot.data, 'base64'));
+});

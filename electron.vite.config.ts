@@ -17,7 +17,7 @@ export default defineConfig({
   },
   preload: {
     build: {
-      rollupOptions: { input: resolve(__dirname, 'src/preload/index.ts') },
+      rollupOptions: { input: { index: resolve(__dirname, 'src/preload/index.ts'), browser: resolve(__dirname, 'src/preload/browser.ts') } },
     },
     resolve: { alias: { '@shared': shared } },
   },
@@ -27,6 +27,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           editor: resolve(__dirname, 'src/renderer/editor/index.html'),
+          browser: resolve(__dirname, 'src/renderer/browser/index.html'),
           present: resolve(__dirname, 'src/renderer/present/index.html'),
           presenter: resolve(__dirname, 'src/renderer/presenter/index.html'),
           print: resolve(__dirname, 'src/renderer/print/index.html'),

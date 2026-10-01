@@ -52,6 +52,7 @@ import {
   copyDeck,
   derivedAssetPath,
   importAsset,
+  importWebPage,
   importImageBuffer,
   loadDeck,
   loadTheme,
@@ -67,6 +68,8 @@ import { probeMedia, runTrim } from './ffmpeg.js';
 import { attachRendererHealth } from './windowHealth.js';
 import { POSTER_HOST, posterFor } from './posterCache.js';
 import { showOpenDialog, showSaveDialog } from './dialogs.js';
+import { openWebsiteBrowser } from './websiteBrowser.js';
+import { injectWebBridgeRuntime } from '../shared/webBridge.js';
 import { importPymol } from './pymolImport.js';
 import { importKeynote } from './keynoteImport.js';
 import { importPowerPoint } from './pptxImport.js';
@@ -819,6 +822,29 @@ function registerHandlers(): void {
     // Our own write; the watcher event it fires is an echo, not an edit.
     requireOwner(event).lastWrittenHtml.set(target, contents);
     await writeFile(target, contents, 'utf8');
+  });
+
+  ipcMain.handle(IPC.websiteOpen, event => {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    requireOwner(event);
+    if (parent) openWebsiteBrowser(parent);
+  });
+
+  ipcMain.handle(IPC.htmlImport, async (event, operationId: string, sourcePath?: string) => {
+    const session = requireSession(event);
+    let path = sourcePath;
+    if (path === undefined) {
+      const picked = await showOpenDialog({
+        title: 'Import interactive HTML page', properties: ['openFile'],
+        filters: [{ name: 'HTML document', extensions: ['html', 'htm', 'xhtml'] }],
+      });
+      if (picked.canceled || !picked.filePaths[0]) return null;
+      path = picked.filePaths[0];
+    }
+    if (typeof path !== 'string' || !path) throw new Error('The dropped HTML document has no local file path');
+    reportOperation(event, operationId, `Importing ${basename(path)}`);
+    const page = await importWebPage(session.dir, path, injectWebBridgeRuntime);
+    return { src: page.src, poster: null, title: basename(path, extname(path)) };
   });
 
   ipcMain.handle(IPC.pymolImport, async (event, operationId: string, sourcePath?: string) => {

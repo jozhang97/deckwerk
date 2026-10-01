@@ -27,6 +27,8 @@ export const IPC = {
   themeCss: 'deck:themeCss',
   assetImport: 'asset:import',
   pymolImport: 'pymol:import',
+  htmlImport: 'html:import',
+  websiteOpen: 'website:open',
   assetImportUrl: 'asset:importUrl',
   assetImportProgress: 'asset:importProgress',
   clipboardWrite: 'clipboard:write',

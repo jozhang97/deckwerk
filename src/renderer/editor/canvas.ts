@@ -653,6 +653,8 @@ export class EditorCanvas {
   private sizeMatches: SizeGuide[] = [];
   private marquee: Rect | null = null;
 
+  /** Desktop-only import path for dropped interactive HTML documents. */
+  onHtmlDrop?: (files: File[], point: { x: number; y: number }) => Promise<void>;
   /** Desktop-only import path for dropped molecular sessions. */
   onPymolDrop?: (files: File[], point: { x: number; y: number }) => Promise<void>;
   /** Called to open the trim window for a video. */
@@ -6185,9 +6187,12 @@ export class EditorCanvas {
       // Photos, a browser's "save image" and scanners hand over `image`,
       // `photo.jfif` or `scan.tiff`, and those used to vanish without a word.
       const dropped = [...(e.dataTransfer?.files ?? [])];
+      const pages = this.onHtmlDrop ? dropped.filter(file => /\.x?html?$/i.test(file.name)) : [];
+      if (pages.length) void this.onHtmlDrop!(pages, dropPoint);
       const sessions = this.onPymolDrop ? dropped.filter(file => /\.pse$/i.test(file.name)) : [];
       if (sessions.length) void this.onPymolDrop!(sessions, dropPoint);
       const files = dropped.flatMap((original) => {
+        if (pages.includes(original) || sessions.includes(original)) return [];
         const name = mediaFileName(original.name, original.type);
         const kind = name ? classifyMediaName(name) : null;
         if (!name || (kind !== 'image' && kind !== 'video')) return [];
@@ -6196,18 +6201,20 @@ export class EditorCanvas {
           : new File([original], name, { type: original.type, lastModified: original.lastModified });
         return [{ file, kind }];
       });
-      const refused = dropped.filter((file) => !sessions.includes(file) && !mediaFileName(file.name, file.type)).map((file) => file.name);
+      const refused = dropped.filter((file) => !pages.includes(file) && !sessions.includes(file) && !mediaFileName(file.name, file.type)).map((file) => file.name);
       // Read while the event is still dispatching: the drag's data is gone after.
       const offeredImage = /<img\b/i.test(e.dataTransfer?.getData('text/html') ?? '')
         || (e.dataTransfer?.types ?? []).includes('text/uri-list');
       // A drag out of a web page carries no file at all -- only markup and the
       // image's URL -- so it takes the fetch-the-bytes path instead.
-      const allowed = this.onPymolDrop ? 'images, videos, and PyMOL sessions' : 'images and videos';
-      if (sessions.length > 0 && refused.length > 0) {
+      const allowed = ['images', 'videos', ...(this.onHtmlDrop ? ['HTML pages'] : []),
+        ...(this.onPymolDrop ? ['PyMOL sessions'] : [])].join(', ');
+      const specialFiles = sessions.length + pages.length;
+      if (specialFiles > 0 && refused.length > 0) {
         this.notice(`Skipped ${refused.join(', ')}: only ${allowed} can go on a slide.`);
       }
       if (files.length === 0) {
-        if (sessions.length > 0) return;
+        if (specialFiles > 0) return;
         const fetched = await this.dropWebImage(e.dataTransfer, dropPoint);
         if (!fetched && (refused.length > 0 || offeredImage)) {
           this.notice(refused.length > 0
@@ -6216,7 +6223,7 @@ export class EditorCanvas {
         }
         return;
       }
-      if (refused.length > 0 && sessions.length === 0) {
+      if (refused.length > 0 && specialFiles === 0) {
         this.notice(`Skipped ${refused.join(', ')}: only ${allowed} can go on a slide.`);
       }
 

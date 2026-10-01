@@ -126,6 +126,16 @@ let initialViewPending = initialView !== null;
 setRenderInvariantChecks(import.meta.env.DEV);
 setSelectionInvariantChecks(import.meta.env.DEV);
 const canvas = new EditorCanvas(el('canvas'), store);
+if (typeof window.api.importHtmlFile === 'function') {
+  canvas.onHtmlDrop = async (files, point) => {
+    const initial = store.get();
+    const slideId = initial.deck.slides[initial.slideIndex]?.id;
+    for (const [index, file] of files.entries()) {
+      if (store.get().dir !== initial.dir) break;
+      await embedHtml({ file, slideId, point: { x: point.x + index * 40, y: point.y + index * 40 } });
+    }
+  };
+}
 if (typeof window.api.importPymolFile === 'function') {
   canvas.onPymolDrop = async (files, point) => {
     const initial = store.get();
@@ -433,6 +443,14 @@ function buildToolbar(): void {
     { label: 'Keynote…', action: () => void importKeynotePresentation() },
     { label: 'PowerPoint…', action: () => void importPowerPointPresentation() },
   ];
+  if (typeof window.api.importHtml === 'function') {
+    importEntries.push(
+      { label: 'HTML page…', action: () => void embedHtml() },
+      { label: 'Browse website…', action: () => {
+        void window.api.openWebsite().catch(error => setStatusMessage(`Could not open browser: ${error}`));
+      } },
+    );
+  }
   const saveEntries = [
     { label: 'Deck…', action: () => void saveAsPresentation() },
     {
@@ -846,6 +864,47 @@ async function saveAsPresentation(): Promise<void> {
   } catch (err) {
     setStatusMessage(`Save As failed: ${err instanceof Error ? err.message : err}`);
   }
+}
+
+let htmlImportRunning = false;
+async function embedHtml(drop?: { file: File; slideId: string; point: { x: number; y: number } }): Promise<void> {
+  if (htmlImportRunning) {
+    setStatusMessage('An HTML page is still importing. Drop the file again when it finishes.');
+    return;
+  }
+  const before = store.get();
+  const slideId = drop?.slideId ?? before.deck.slides[before.slideIndex]?.id;
+  if (!slideId || !before.dir) {
+    setStatusMessage('Open or create a presentation before importing an HTML page.');
+    return;
+  }
+  htmlImportRunning = true;
+  try {
+    const result = await runOperation('Importing HTML page…', operation => drop
+      ? window.api.importHtmlFile(drop.file, operation.id)
+      : window.api.importHtml(operation.id));
+    if (!result) return;
+    if (store.get().dir !== before.dir || !store.get().deck.slides.some(slide => slide.id === slideId)) {
+      setStatusMessage('The destination slide was removed. Import the page again on another slide.');
+      return;
+    }
+    const id = makeId('web');
+    store.commit(deck => {
+      const slide = deck.slides.find(s => s.id === slideId)!;
+      slide.elements.push({
+        id, type: 'web', ...result, interactive: true,
+        x: drop ? drop.point.x - deck.canvas.w * 0.45 : deck.canvas.w * 0.05,
+        y: drop ? drop.point.y - deck.canvas.h * 0.45 : deck.canvas.h * 0.05,
+        w: deck.canvas.w * 0.9, h: deck.canvas.h * 0.9,
+        rot: 0, opacity: 1, z: Math.max(0, ...slide.elements.map(e => e.z)) + 1,
+        class: [], style: {},
+      });
+    }, { label: 'Import HTML page' });
+    if (store.get().deck.slides[store.get().slideIndex]?.id === slideId) store.select([id]);
+    setStatusMessage(`Imported ${result.title}. Double-click to interact. HTML pages should include their scripts, styles and images inline.`);
+  } catch (error) {
+    setStatusMessage(`HTML import failed: ${error instanceof Error ? error.message : error}`);
+  } finally { htmlImportRunning = false; }
 }
 
 let pymolImportRunning = false;
