@@ -79,6 +79,12 @@ Drag and drop video onto a slide. Crop it, trim it, adjust its appearance, and p
 
 DeckWerk auto-transcodes videos and images into compatible formats.
 
+### Interactive molecules
+
+Use **PyMOL…** in the desktop toolbar to embed a `.pse` session on a slide.
+Drag to rotate and scroll to zoom while presenting, including offline web
+exports. See [PyMOL sessions](docs/pymol.md) for usage and compatibility details.
+
 ### Native agent integration
 
 DeckWerk is designed so that AI agents can create and edit presentations directly. It does not run or own an agent account: for a local presentation, the **Agent…** button gives you its real deck folder and no server is involved. In a browser collaboration session, the same button gives you one command that mirrors the remote live deck folder onto your machine and keeps it in sync. Only Node is needed for that remote bridge.

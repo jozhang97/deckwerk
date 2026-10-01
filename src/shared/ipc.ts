@@ -26,6 +26,7 @@ export const IPC = {
   deckKey: 'deck:key',
   themeCss: 'deck:themeCss',
   assetImport: 'asset:import',
+  pymolImport: 'pymol:import',
   assetImportUrl: 'asset:importUrl',
   assetImportProgress: 'asset:importProgress',
   clipboardWrite: 'clipboard:write',
@@ -223,6 +224,12 @@ export interface ImportedAsset {
   height: number | null;
   /** Seconds, for video only. */
   duration: number | null;
+}
+
+export interface ImportedPymol {
+  src: string;
+  poster: string;
+  title: string;
 }
 
 /**

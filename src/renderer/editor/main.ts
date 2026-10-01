@@ -7,7 +7,7 @@ import type { Deck, SlideElement } from '@shared/deck.js';
 import { emptyDeck } from '@shared/deck.js';
 import type { AgentSessionConnection, AuthoredHtmlFile, PresentationImportResult } from '@shared/ipc.js';
 import { captureEditorView, decodeEditorView, restoreEditorView } from '@shared/editorView.js';
-import { setIdSuffix } from '@shared/geometry.js';
+import { makeId, setIdSuffix } from '@shared/geometry.js';
 import { adoptAuthoredIds, describeHtmlSync, htmlSyncSummary } from '@shared/htmlSlides.js';
 import { rangeForSlideSelection } from '@shared/presentationRange.js';
 import {
@@ -126,6 +126,16 @@ let initialViewPending = initialView !== null;
 setRenderInvariantChecks(import.meta.env.DEV);
 setSelectionInvariantChecks(import.meta.env.DEV);
 const canvas = new EditorCanvas(el('canvas'), store);
+if (typeof window.api.importPymolFile === 'function') {
+  canvas.onPymolDrop = async (files, point) => {
+    const initial = store.get();
+    const slideId = initial.deck.slides[initial.slideIndex]?.id;
+    for (const [index, file] of files.entries()) {
+      if (store.get().dir !== initial.dir) break;
+      await embedPymol({ file, slideId, point: { x: point.x + index * 40, y: point.y + index * 40 } });
+    }
+  };
+}
 el('canvas').addEventListener(CANVAS_NOTICE_EVENT, (event) => {
   setStatusMessage((event as CustomEvent<string>).detail);
 });
@@ -473,6 +483,12 @@ function buildToolbar(): void {
     createShapeInsertPicker(store),
     createTableInsertPicker(store),
   );
+  if (typeof window.api.importPymol === 'function') {
+    const pymol = barButton('PyMOL…', () => void embedPymol());
+    pymol.id = 'pymol-import-trigger';
+    pymol.title = 'Embed a PyMOL session (.pse) on this slide';
+    mid.append(pymol);
+  }
 
   const right = document.createElement('div');
   right.className = 'bar-group bar-right deck-only';
@@ -829,6 +845,50 @@ async function saveAsPresentation(): Promise<void> {
     setStatusMessage(`Saved as ${session.dir}`);
   } catch (err) {
     setStatusMessage(`Save As failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+let pymolImportRunning = false;
+async function embedPymol(drop?: { file: File; slideId: string; point: { x: number; y: number } }): Promise<void> {
+  if (pymolImportRunning) {
+    setStatusMessage('A PyMOL session is still importing. Drop the file again when it finishes.');
+    return;
+  }
+  const initial = store.get();
+  const slideId = drop?.slideId ?? initial.deck.slides[initial.slideIndex]?.id;
+  if (!initial.dir || !slideId) return;
+  pymolImportRunning = true;
+  const trigger = document.getElementById('pymol-import-trigger') as HTMLButtonElement | null;
+  if (trigger) trigger.disabled = true;
+  try {
+    const result = await runOperation('Importing PyMOL session…', (operation) => drop
+      ? window.api.importPymolFile(drop.file, operation.id)
+      : window.api.importPymol(operation.id));
+    if (!result) return;
+    if (store.get().dir !== initial.dir || !store.get().deck.slides.some(s => s.id === slideId)) {
+      setStatusMessage('PyMOL import finished, but its original slide is no longer open');
+      return;
+    }
+    const id = makeId('web');
+    store.commit(deck => {
+      const slide = deck.slides.find(s => s.id === slideId)!;
+      const w = deck.canvas.w * 0.7;
+      const h = Math.min(deck.canvas.h * 0.8, w * 2 / 3);
+      slide.elements.push({
+        id, type: 'web', ...result, interactive: true,
+        x: drop ? drop.point.x - w / 2 : (deck.canvas.w - w) / 2,
+        y: drop ? drop.point.y - h / 2 : (deck.canvas.h - h) / 2, w, h,
+        rot: 0, opacity: 1, z: Math.max(0, ...slide.elements.map(e => e.z)) + 1,
+        class: [], style: {},
+      });
+    }, { label: 'Embed PyMOL session' });
+    if (store.get().deck.slides[store.get().slideIndex]?.id === slideId) store.select([id]);
+    setStatusMessage(`Embedded ${result.title}. Drag to rotate and scroll to zoom while presenting.`);
+  } catch (error) {
+    setStatusMessage(`PyMOL import failed: ${error instanceof Error ? error.message : error}`);
+  } finally {
+    pymolImportRunning = false;
+    if (trigger) trigger.disabled = false;
   }
 }
 

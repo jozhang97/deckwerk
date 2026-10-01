@@ -18,6 +18,7 @@ import type {
   DeckSessionSnapshot,
   DeckHistorySession,
   ImportedAsset,
+  ImportedPymol,
   PresentationImportResult,
   MediaInfo,
   OperationProgress,
@@ -61,6 +62,10 @@ ipcRenderer.on(IPC.deckKey, (_e, key: string) => {
  * nodeIntegration is off, so this surface is deliberately small and explicit.
  */
 const api = {
+  importPymolFile: (file: File, operationId: string): Promise<ImportedPymol | null> =>
+    ipcRenderer.invoke(IPC.pymolImport, operationId, webUtils.getPathForFile(file)),
+  importPymol: (operationId: string): Promise<ImportedPymol | null> =>
+    ipcRenderer.invoke(IPC.pymolImport, operationId),
   /**
    * Null when the author cancelled, and also when the deck opened in a window
    * of its own because this window already held a presentation. Either way

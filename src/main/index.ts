@@ -67,6 +67,7 @@ import { probeMedia, runTrim } from './ffmpeg.js';
 import { attachRendererHealth } from './windowHealth.js';
 import { POSTER_HOST, posterFor } from './posterCache.js';
 import { showOpenDialog, showSaveDialog } from './dialogs.js';
+import { importPymol } from './pymolImport.js';
 import { importKeynote } from './keynoteImport.js';
 import { importPowerPoint } from './pptxImport.js';
 import { loadDeckHistory, saveDeckHistory } from './deckHistoryStore.js';
@@ -818,6 +819,22 @@ function registerHandlers(): void {
     // Our own write; the watcher event it fires is an echo, not an edit.
     requireOwner(event).lastWrittenHtml.set(target, contents);
     await writeFile(target, contents, 'utf8');
+  });
+
+  ipcMain.handle(IPC.pymolImport, async (event, operationId: string, sourcePath?: string) => {
+    const session = requireSession(event);
+    if (sourcePath !== undefined) {
+      if (typeof sourcePath !== 'string' || !sourcePath) throw new Error('The dropped session has no local file path');
+      return importPymol(session.dir, sourcePath,
+        (message) => reportOperation(event, operationId, message));
+    }
+    const picked = await showOpenDialog({
+      title: 'Embed PyMOL session', properties: ['openFile'],
+      filters: [{ name: 'PyMOL session', extensions: ['pse'] }],
+    });
+    if (picked.canceled || !picked.filePaths[0]) return null;
+    return importPymol(session.dir, picked.filePaths[0],
+      (message) => reportOperation(event, operationId, message));
   });
 
   ipcMain.handle(

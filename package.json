@@ -10,7 +10,7 @@
   },
   "license": "MIT",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "electron-vite dev --watch",
     "predev": "npm run build:collab",
     "precollab": "node scripts/check-collab-environment.cjs && npm run build:collab",
     "build": "tsc --noEmit && electron-vite build && npm run build:collab",
