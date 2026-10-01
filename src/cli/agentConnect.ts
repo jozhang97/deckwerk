@@ -1003,8 +1003,31 @@ function waitForStop(signal?: AbortSignal): Promise<void> {
   });
 }
 
+const MIRROR_DRAFT_STEP = `Start each new slide from a fresh page in \`edit/\` — the only folder that
+syncs — with \`./deck new > edit/slide.html\`, then fill in its \`<section>\`:
+`;
+
+const MIRROR_APPLY_STEP = `## 3. Put it in the deck
+
+Saving a page in \`edit/\` updates the shared deck within a second or two;
+there is no separate upload. To choose where a new slide goes, run apply right
+after you write the page:
+
+    ./deck apply . --html edit/slide.html --after 8    # insert after slide 8
+
+Each sync stamps \`data-slide-id\` into your file, and saving it again replaces
+that slide. So never copy a page to start another: the copy carries the same
+ids and overwrites the original's slides. To **replace an existing slide**,
+copy its id (from \`inspect --html\`) onto your \`<section>\` and save.
+To delete or reorder slides, \`./deck inspect . --html --slide 8,9 >
+edit/work.html\`, then remove or reorder the \`<section>\`s there and save.
+
+Check \`changes\` in apply's output: a \`deleted\` entry you did not intend
+means stop and undo in the editor.
+`;
+
 /**
- * The deck brief for a mirror: the desktop's `AGENTS.md`, with `./deck` in
+ * The deck brief for a mirror:the desktop's `AGENTS.md`, with `./deck` in
  * place of `slide-agent` and a section on what this folder is.
  */
 export function mirrorAgentGuide(target: SessionTarget): string {
@@ -1012,14 +1035,21 @@ export function mirrorAgentGuide(target: SessionTarget): string {
 The command here is \`./deck\`, in this folder — run it as \`./deck <command>\`.
 It takes the same commands and flags as \`slide-agent\` and talks to the
 collaboration server this folder mirrors; \`./deck help\` lists them. Nothing
-needs installing. \`theme.css\` is a plain file: edit it directly.
+needs installing. \`theme.css\` is a plain file too, but prefer
+\`./deck theme\`, which installs a built-in theme the way the editor does.
 `;
   // Rename the CLI throughout the brief, then drop in the hint, which is the
   // one place that has to name `slide-agent` as something different.
   const guide = renderAgentGuide({ launcherHint: '{{MIRROR_HINT}}' })
     .replaceAll('slide-agent ', './deck ')
     .replaceAll('`slide-agent`', '`./deck`')
-    .replace('{{MIRROR_HINT}}', hint);
+    .replace('{{MIRROR_HINT}}', hint)
+    // Here `edit/` is the only place a page can sync from, and saving there
+    // already syncs it: the desktop's drafts/ recipe would be refused.
+    .replace(/Create `drafts\/slide\.html`[^\n]*\n/, MIRROR_DRAFT_STEP)
+    .replaceAll('drafts/slide.html', 'edit/slide.html')
+    .replaceAll('--html-body', '--html')
+    .replace(/## 3\. Put it in the deck\n[\s\S]*?(?=\n## 4\.)/, MIRROR_APPLY_STEP);
   return `${guide}
 ## This folder is a live mirror
 
