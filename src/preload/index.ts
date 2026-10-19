@@ -110,6 +110,10 @@ const api = {
   readClipboard: (): Promise<ClipboardReadResult | null> =>
     ipcRenderer.invoke(IPC.clipboardRead),
 
+  importYoutube: (url: string, operationId: string): Promise<ImportedAsset> =>
+    ipcRenderer.invoke(IPC.youtubeImport, url, operationId),
+  cancelYoutube: (): Promise<void> => ipcRenderer.invoke(IPC.youtubeCancel),
+
   importAssets: (paths: string[], progressToken?: string): Promise<ImportedAsset[]> =>
     ipcRenderer.invoke(IPC.assetImport, paths, progressToken),
   /**

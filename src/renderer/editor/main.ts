@@ -31,6 +31,7 @@ import { HistoryPanel } from './historyPanel.js';
 import { authoredHtmlSync, fileName } from './htmlCompile.js';
 import { createShapeInsertPicker, createTableInsertPicker, insertText } from './elementCreation.js';
 import { createToolbarPicker, createToolbarSplitButton } from './exportPicker.js';
+import { showYoutubeDialog } from './youtubeDialog.js';
 import { showPdfExportDialog } from './pdfExportDialog.js';
 import { showWebExportDialog } from './webExportDialog.js';
 import { makePanelResizable } from './panelResize.js';
@@ -506,6 +507,9 @@ function buildToolbar(): void {
     { label: 'Keynote…', action: () => void importKeynotePresentation() },
     { label: 'PowerPoint…', action: () => void importPowerPointPresentation() },
   ];
+  if (typeof window.api.importYoutube === 'function') {
+    importEntries.push({ label: 'YouTube video…', action: () => void importYoutubeVideo() });
+  }
   if (typeof window.api.importHtml === 'function') {
     importEntries.push(
       { label: 'HTML page…', action: () => void embedHtml() },
@@ -940,6 +944,42 @@ async function saveAsPresentation(): Promise<void> {
   } catch (err) {
     setStatusMessage(`Save As failed: ${err instanceof Error ? err.message : err}`);
   }
+}
+
+function importYoutubeVideo(): void {
+  const initial = store.get();
+  const slideId = initial.deck.slides[initial.slideIndex]?.id;
+  if (!initial.dir || !slideId) {
+    setStatusMessage('Open or create a presentation before importing a YouTube video.');
+    return;
+  }
+  showYoutubeDialog(async url => {
+    try {
+      if (store.get().dir !== initial.dir) throw new Error('The destination presentation changed. Reopen YouTube import.');
+      const asset = await runOperation('Reading YouTube video…', operation => window.api.importYoutube(url, operation.id));
+      if (store.get().dir !== initial.dir || !store.get().deck.slides.some(s => s.id === slideId)) {
+        throw new Error('The destination slide is no longer open. The video was saved in the original presentation’s assets.');
+      }
+      const id = makeId('video');
+      store.commit(deck => {
+        const slide = deck.slides.find(s => s.id === slideId)!;
+        const width = asset.width ?? 1920, height = asset.height ?? 1080;
+        const scale = Math.min(1, deck.canvas.w * 0.8 / width, deck.canvas.h * 0.8 / height);
+        const w = width * scale, h = height * scale;
+        slide.elements.push({
+          id, type: 'video', src: asset.src, x: (deck.canvas.w - w) / 2, y: (deck.canvas.h - h) / 2,
+          w, h, rot: 0, opacity: 1, z: Math.max(0, ...slide.elements.map(e => e.z)) + 1,
+          class: [], style: {}, fit: 'contain', sourceBox: null, poster: null,
+          autoplay: false, loop: false, muted: false, controls: true, start: 0, end: null,
+        });
+      }, { label: 'Import YouTube video' });
+      if (store.get().deck.slides[store.get().slideIndex]?.id === slideId) store.select([id]);
+      setStatusMessage('YouTube video added. It is saved in this presentation for offline playback.');
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }, () => window.api.cancelYoutube());
 }
 
 let htmlImportRunning = false;

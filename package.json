@@ -16,6 +16,7 @@
     "build": "tsc --noEmit && electron-vite build && npm run build:collab",
     "build:export": "vite build --config vite.export.config.ts",
     "build:importer": "node scripts/build-importer.mjs",
+    "setup:youtube": "node scripts/setup-youtube.mjs",
     "setup:importers": "node scripts/setup-importers.mjs",
     "postinstall": "node scripts/setup-importers.mjs",
     "prepare:media": "vite-node --config vitest.config.ts scripts/prepare-media.mts --",

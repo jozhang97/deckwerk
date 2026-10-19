@@ -27,6 +27,8 @@ export const IPC = {
   deckKey: 'deck:key',
   themeCss: 'deck:themeCss',
   assetImport: 'asset:import',
+  youtubeImport: 'youtube:import',
+  youtubeCancel: 'youtube:cancel',
   pymolImport: 'pymol:import',
   htmlImport: 'html:import',
   websiteOpen: 'website:open',

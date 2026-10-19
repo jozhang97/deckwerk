@@ -72,6 +72,7 @@ import { attachRendererHealth } from './windowHealth.js';
 import { POSTER_HOST, posterFor } from './posterCache.js';
 import { showOpenDialog, showSaveDialog } from './dialogs.js';
 import { openWebsiteBrowser } from './websiteBrowser.js';
+import { importYoutube } from './youtubeImport.js';
 import { importPymol } from './pymolImport.js';
 import { importKeynote } from './keynoteImport.js';
 import { importPowerPoint } from './pptxImport.js';
@@ -839,6 +840,28 @@ function registerHandlers(): void {
     // Replaced, not written in place: an agent reading its page meanwhile
     // would otherwise find it empty.
     await replaceFileAtomically(target, contents);
+  });
+
+  const youtubeJobs = new Map<number, AbortController>();
+  ipcMain.handle(IPC.youtubeCancel, event => {
+    requireOwner(event);
+    youtubeJobs.get(event.sender.id)?.abort();
+  });
+  ipcMain.handle(IPC.youtubeImport, async (event, url: string, operationId: string) => {
+    const session = requireSession(event);
+    const owner = event.sender.id;
+    if (youtubeJobs.has(owner)) throw new Error('A YouTube import is already running.');
+    const controller = new AbortController();
+    youtubeJobs.set(owner, controller);
+    const abort = () => controller.abort();
+    event.sender.once('destroyed', abort);
+    try {
+      return await importYoutube(session.dir, url, controller.signal,
+        (message, ratio) => reportOperation(event, operationId, message, ratio));
+    } finally {
+      event.sender.removeListener('destroyed', abort);
+      youtubeJobs.delete(owner);
+    }
   });
 
   ipcMain.handle(IPC.websiteOpen, event => {

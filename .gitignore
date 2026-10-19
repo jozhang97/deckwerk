@@ -41,3 +41,6 @@ example-keynote-decks/*
 
 # Built website (npm run build:site).
 dist-site/
+
+# Local YouTube downloader.
+.venv-youtube/
