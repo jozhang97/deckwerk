@@ -22,7 +22,7 @@ import { mediaVariantsSnapshot, pinMediaVariant, setMediaVariants } from './medi
 import { trackVideoLoading } from '../player/videoLoadingProgress.js';
 import { VideoBlobCache } from '../player/videoBlobCache.js';
 import { eventOnInteractiveWeb, slideLinkFromEvent } from '../player/links.js';
-import { selectionPreventsAdvance } from '../player/presentationPointer.js';
+import { eventOnMediaControls, selectionPreventsAdvance } from '../player/presentationPointer.js';
 import type { PresenceState, RemoteCommand, RemoteState } from '@shared/collab.js';
 import { bindSwipe, PresenterRemotes } from './remoteControl.js';
 
@@ -298,13 +298,15 @@ function unmountAudience(): void {
 
 // A click advances, like a presenter remote; double-click toggles fullscreen.
 window.addEventListener('click', (event) => {
+  if (eventOnMediaControls(event)) return;
   if (consumeFullscreenGesture()) return;
   if (role !== 'audience' || agentViewer) return;
   if (slideLinkFromEvent(event) || eventOnInteractiveWeb(event)) return;
   if (selectionPreventsAdvance()) return;
   advance();
 });
-window.addEventListener('dblclick', () => {
+window.addEventListener('dblclick', (event) => {
+  if (eventOnMediaControls(event) || eventOnInteractiveWeb(event)) return;
   if (role !== 'audience' || agentViewer) return;
   if (embedded) exitPresentation();
   else if (document.fullscreenElement) void document.exitFullscreen();

@@ -18,10 +18,12 @@ it('downloads into the deck, plays offline, undoes, and handles invalid input, f
   work = await mkdtemp(join(tmpdir(), 'deckwerk-youtube-test-'));
   const deckDir = join(work, 'deck'), appDir = join(work, 'app'), profileDir = join(work, 'profile');
   await mkdir(profileDir);
-  await saveDeck(deckDir, emptyDeck('YouTube'));
+  const deck = emptyDeck('YouTube');
+  deck.slides.push({ ...structuredClone(deck.slides[0]), id: 'next-slide' });
+  await saveDeck(deckDir, deck);
   await writeFile(join(deckDir, 'theme.css'), '');
   const fixture = join(work, 'fixture.mp4');
-  await promisify(execFile)(getFfmpegPath(), ['-y', '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=10', '-t', '1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', fixture]);
+  await promisify(execFile)(getFfmpegPath(), ['-y', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=10', '-t', '5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', fixture]);
   // Only the external network boundary is substituted. IPC, importer, ffprobe,
   // file copying, rendering, progress and undo are the real desktop app.
   const downloader = join(work, 'yt-dlp');
@@ -74,6 +76,34 @@ else setTimeout(() => { fs.copyFileSync(${JSON.stringify(fixture)}, path.join(ou
   await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas video').length === 0`), 'undo');
   await editor.chord('z', 'KeyZ', 90, mod | 8);
   await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas video').length === 1`), 'redo');
+  await editor.clickByText('button', 'Present');
+  const audience = await findTarget(app.debugPort, t => t.url.includes('/present/index.html'), app.log);
+  const player = await Cdp.connect(audience.webSocketDebuggerUrl!);
+  try {
+    await eventually(() => player.evaluate(`document.querySelector('video')?.readyState >= 2`), 'presentation video loaded');
+    const box = await player.evaluate<{ x: number; y: number; width: number; height: number }>(`(() => {
+      const r = document.querySelector('video').getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height };
+    })()`);
+    // Real mouse input, not video.play(): the control must own this gesture.
+    await player.clickAt(box.x - box.width / 2 + 24, box.y + box.height / 2 - 48);
+    await eventually(() => player.evaluate(`document.querySelector('video')?.currentTime > 0.4 && !document.querySelector('video').paused`), 'native play control starts video');
+    await player.clickAt(box.x - box.width / 2 + 24, box.y + box.height / 2 - 48);
+    await eventually(() => player.evaluate(`document.querySelector('video')?.paused`), 'native pause control pauses video');
+    await player.click('video');
+    expect(await player.evaluate(`!!document.querySelector('video')`)).toBe(true);
+    expect(await player.evaluate(`getComputedStyle(document.querySelector('video')).cursor`)).toBe('auto');
+    await player.clickAt(20, 20);
+    await eventually(() => player.evaluate(`!document.querySelector('video')`), 'click outside video still advances');
+    // Escape destroys this window, so its CDP response may lose the race to teardown.
+    await player.chord('Escape', 'Escape', 27, 0).catch(error => {
+      if (!(error instanceof Error) || error.message !== 'Electron DevTools connection closed') throw error;
+    });
+    await eventually(async () => {
+      const targets = await (await fetch(`http://127.0.0.1:${app.debugPort}/json/list`)).json() as { id: string }[];
+      return !targets.some(target => target.id === audience.id);
+    }, 'Escape closed the presentation');
+  } finally { player.close(); }
   await open(); await submit('https://youtu.be/bbbbbbbbbbb');
   await eventually(() => editor.evaluate(`document.querySelector('#youtube-error').textContent.includes('Video unavailable')`), 'failure');
   await editor.click('[data-cancel]', 'close error');

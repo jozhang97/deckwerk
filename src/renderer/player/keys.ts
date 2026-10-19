@@ -1,3 +1,4 @@
+import { eventOnMediaControls } from './presentationPointer.js';
 import type { Player } from './player.js';
 
 /**
@@ -24,6 +25,8 @@ export function bindPresentKeys(
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) {
       return;
     }
+
+    if (e.key !== 'Escape' && eventOnMediaControls(e)) return;
 
     switch (e.key) {
       case 'ArrowRight':

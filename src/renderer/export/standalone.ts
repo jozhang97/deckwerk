@@ -1,3 +1,4 @@
+import { eventOnMediaControls } from '../player/presentationPointer.js';
 import '../player/player.css';
 import { parseDeck } from '@shared/deck.js';
 import { bindPresentKeys } from '../player/keys.js';
@@ -53,7 +54,7 @@ function boot(): void {
   jumpToHash();
 
   window.addEventListener('mousedown', (e) => {
-    if (slideLinkFromEvent(e) || eventOnInteractiveWeb(e)) return;
+    if (slideLinkFromEvent(e) || eventOnInteractiveWeb(e) || eventOnMediaControls(e)) return;
     if (e.button === 0) player.next();
     else if (e.button === 2) player.prev();
   });

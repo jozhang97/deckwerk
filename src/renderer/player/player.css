@@ -47,6 +47,9 @@
   display: block;
 }
 
+/* Presentation surfaces hide the pointer; native playback controls need it. */
+.element video[controls] { cursor: auto; }
+
 /* Chromium prints a video surface as black when decoding fails. Give the
    on-screen Player the same stable fallback instead of exposing the slide
    background through a transparent, unplayable media box -- but only then:
