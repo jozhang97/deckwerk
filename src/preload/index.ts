@@ -71,6 +71,8 @@ const api = {
     ipcRenderer.invoke(IPC.pymolImport, operationId, webUtils.getPathForFile(file)),
   importPymol: (operationId: string): Promise<ImportedPymol | null> =>
     ipcRenderer.invoke(IPC.pymolImport, operationId),
+  /** A PNG data URL of this window as it looks now; null if it could not be read. */
+  captureWindow: (): Promise<string | null> => ipcRenderer.invoke(IPC.windowCapture),
   /**
    * Null when the author cancelled, and also when the deck opened in a window
    * of its own because this window already held a presentation. Either way
@@ -134,6 +136,12 @@ const api = {
     on(IPC.assetImportProgress, fn),
   probeAsset: (src: string): Promise<MediaInfo> =>
     ipcRenderer.invoke(IPC.assetProbe, src),
+  /**
+   * Save the untouched file behind an image or video src where the author
+   * picks; the saved path, or null when they cancel the panel.
+   */
+  saveOriginalAsset: (src: string, operationId?: string): Promise<string | null> =>
+    ipcRenderer.invoke(IPC.assetSaveOriginal, src, operationId),
   /**
    * One frame of a deck video as an image URL, cut in the main process, so a
    * thumbnail never has to open a video pipeline in this window.

@@ -8,7 +8,7 @@ import { applyStaticSlideState } from '../player/staticState.js';
 import { formatElapsed, formatWallClock, presentationLabel } from './model.js';
 
 /**
- * Speaker View: current and next slide, build position, presentation and slide
+ * Speaker View: current and next slide, speaker notes, build position, presentation and slide
  * timers, wall clock, and the presenter's controls.
  *
  * One component, two shells. The desktop opens it in its own Electron window
@@ -33,6 +33,10 @@ export interface SpeakerViewOptions {
   /** Label for the swap control, which differs between window and tab shells. */
   swapLabel?: string;
   swapTitle?: string;
+  /** Label for the button that sends `exit`; a remote leaves rather than ending the show. */
+  endLabel?: string;
+  /** Further buttons for the footer, placed before End show (the browser's Remote…). */
+  extraActions?: HTMLElement[];
   /** Injectable clock, so timer formatting is testable without waiting. */
   now?: () => number;
 }
@@ -64,6 +68,10 @@ const MARKUP = `
         <div class="presenter-clock slide-clock"><span>Current slide</span><strong class="speaker-slide-timer">00:00</strong></div>
         <div class="presenter-clock wall-clock"><span>Local time</span><strong class="speaker-wall-clock">--:--</strong></div>
       </section>
+      <section class="notes-panel" aria-label="Speaker notes">
+        <h2>Notes</h2>
+        <div class="speaker-notes"></div>
+      </section>
     </aside>
   </section>
   <footer>
@@ -93,7 +101,11 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
   const presentationTimer = pick('.speaker-presentation-timer');
   const slideTimer = pick('.speaker-slide-timer');
   const wallClock = pick('.speaker-wall-clock');
+  const notes = pick('.speaker-notes');
   const swap = pick<HTMLButtonElement>('.speaker-swap');
+  const end = pick<HTMLButtonElement>('.speaker-end');
+  if (options.endLabel) end.textContent = options.endLabel;
+  for (const action of options.extraActions ?? []) end.before(action);
 
   if (options.canSwapDisplays === false) {
     swap.remove();
@@ -147,6 +159,7 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
     while (nextSlide <= lastSlide && deck.slides[nextSlide]?.skipped) nextSlide += 1;
     preview(nextHost, nextSlide <= lastSlide ? nextSlide : -1);
     position.textContent = presentationLabel(state, deck.slides.length);
+    notes.textContent = deck.slides[state.cursor.slide]?.notes ?? '';
   }
 
   function tick(): void {
@@ -160,7 +173,7 @@ export function createSpeakerView(options: SpeakerViewOptions): SpeakerView {
   pick('.speaker-prev').addEventListener('click', send({ type: 'prev' }));
   pick('.speaker-next-button').addEventListener('click', send({ type: 'next' }));
   pick('.speaker-blank').addEventListener('click', send({ type: 'toggleBlank' }));
-  pick('.speaker-end').addEventListener('click', send({ type: 'exit' }));
+  end.addEventListener('click', send({ type: 'exit' }));
   if (swap.isConnected) swap.addEventListener('click', send({ type: 'swapDisplays' }));
 
   tick();

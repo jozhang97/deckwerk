@@ -47,8 +47,9 @@ ship it in `dist/collab`.
 
 The **Agent…** toolbar button is onboarding for an agent the user already runs.
 On desktop it shows the open deck folder and the `slide-agent` starting
-commands. In a browser collaboration session it shows a `slide-agent connect`
-command that creates a local mirror of the live deck. DeckWerk has no embedded
+commands. In a browser collaboration session it copies a prompt
+(`src/renderer/collab/agentPrompt.ts`) that tells the agent to fetch and
+start the bridge below itself, which creates a local mirror of the live deck. DeckWerk has no embedded
 chat, model picker, login, or server-owned agent account.
 
 After that small difference in setup, both surfaces use the same loop:
@@ -77,6 +78,17 @@ on the canvas, elements with comments show a bubble at their top-right
 corner, and right-click → "Add comment…" starts a thread on any object.
 Comments from a collab session carry the author's display name.
 
+## The edit log
+
+The server appends one line per accepted change to `history.jsonl` in the
+deck folder: when, who (display name, tailnet login with `--access`, client
+id, whether an agent sent it), the label, counts per operation, and the full
+JSON of every slide or object the change deleted, so nothing that vanishes
+is unrecoverable. Replacements are logged by id only. It rotates to
+`history.1.jsonl` at 20 MB, travels with the folder on rename and trash, and
+is never mirrored, served or downloaded. `slide-agent history <deck folder>
+--deleted` reads it; the format is described in `AGENTS.md`.
+
 ## Running a standalone server
 
 Build the browser client once (rebuild after pulling client changes):
@@ -96,6 +108,46 @@ It prints every reachable URL (localhost plus each network interface — the
 tailscale address is among them). Collaborators open the URL in a browser and
 pick a presentation; `?name=Alice` sets the display name, otherwise the client
 asks once and the server falls back to `Guest n`.
+
+### Running under systemd
+
+A standing server is best run as a hardened systemd service: its own user,
+`ProtectHome`, `ProtectSystem=strict`, `NoNewPrivileges`, a syscall filter.
+One thing in that hardening has to give. The server lays out every page an
+agent saves, renders every PNG `./deck render` asks for and runs every
+`./deck web check` in headless Chromium, and Chromium refuses to run without
+its own sandbox — which on Linux lives in user, pid and net namespaces and
+needs chroot(2) and capset(2) to enter them. `RestrictNamespaces=yes` and a
+filter that denies `@privileged` and `@mount` forbid all of that. Pages and
+sockets still work, so such a server looks healthy until an agent's first
+save.
+
+[`packaging/linux/deckwerk-collab-chromium-sandbox.conf`](../packaging/linux/deckwerk-collab-chromium-sandbox.conf)
+is the drop-in that allows exactly those and nothing more:
+
+```bash
+sudo install -D -m 0644 packaging/linux/deckwerk-collab-chromium-sandbox.conf \
+  /etc/systemd/system/deckwerk-collab.service.d/chromium-sandbox.conf
+sudo systemctl daemon-reload && sudo systemctl restart deckwerk-collab
+```
+
+(A root-owned setuid `chrome-sandbox` is no way round it: `NoNewPrivileges`
+ignores setuid bits. Turning Chromium's sandbox off instead would leave
+collaborators' pages rendering with nothing between them and the server's
+decks.)
+
+A server whose browser cannot start refuses to start, and says why in its
+log. So does one that cannot import decks: before it listens, the server runs
+each importer's `--self-check`, imports a small Keynote and PowerPoint deck
+through its own upload code, and runs ffmpeg and ffprobe. The importers' Python
+packages live in the checkout's own `.venv-import`, which `npm ci` creates from
+`importers/requirements.txt` and `npm run collab` brings up to date before
+every start (`npm run setup:importers` does it by hand). A deploy that cannot
+import therefore fails its first health check, and a deploy script that waits
+for the server to answer can roll back, instead of failing somebody's upload with "keynote-parser is not installed". `test/agentCollaborationSandbox.test.ts`
+runs the agent workflow under this policy, and — on a machine where
+`deckwerk-collab.service` is installed — under the unit systemd actually
+resolved.
 
 ### Folders
 
@@ -204,7 +256,7 @@ desktop app's Collaborate/Agent flows never pass it.
 ### Filesystem agents (`slide-agent connect`)
 
 The standalone server uses the same *bring your own filesystem agent* model as
-desktop. The toolbar's **Agent…** button shows a command that downloads the
+desktop. The toolbar's **Agent…** button copies a prompt that has the agent download the
 server's bridge (`/deckwerk-connect.mjs`, built by `vite.bridge.config.ts` into
 `dist/collab`, source `src/cli/agentConnect.ts` + `connectMain.ts`) and runs it
 with Node 22+ against `'<origin>/?deck=<id>&agent=<participant>'`. Nothing is
@@ -377,6 +429,13 @@ exposed for console driving.
   idempotent. Slide-level properties (name, background, layout, timeline)
   travel separately from elements, so renaming a slide never stomps a
   concurrent element edit on it.
+- An agent's saved page replaces the slides it holds, but not blindly: the
+  export fingerprints every slide and object (`data-base`), so a save over a
+  slide somebody changed since the export merges object by object — what the
+  page left alone keeps their edit, what it changed takes the page's, their
+  additions stay and their deletions win (`carrySlideState` in
+  `src/shared/htmlSlides.ts`). The same holds for the desktop editor's
+  watcher and an offline `slide-agent apply`.
 - Undo is op-based and selective: Cmd+Z inverts *your* last edit against the
   *current* deck and broadcasts it as an ordinary transaction. It never
   reverts other people's work; if a peer deleted what you were about to
@@ -432,6 +491,44 @@ would take, is in [Desktop → web feature parity](desktop-web-parity.md).
   brings that window forward rather than opening it twice.
 - Timeline (build) edits are slide-granular: two people editing builds on the
   same slide at the same moment resolve last-write-wins.
-- Two people typing in the same text box at once: the last one to finish
-  (blur) wins. The presence badge shows who is editing what.
+- Two people typing in the same text box at once: both keep their text.
+  Each live-sync push of a box carries the html it was edited from
+  (`replaceElement.baseHtml`), and the server and every client merge it
+  three ways with whatever landed in between (`src/shared/textMerge.ts`);
+  an editor with unsent keystrokes merges incoming changes into its DOM the
+  same way and carries the caret through them. Edits to the very same words
+  resolve to the later one, and two people typing at exactly the same point
+  keep every letter and every word whole, but whose space sits between the
+  two runs is not decided. The presence badge shows who is editing what.
 - Presence and edits are unauthenticated by design — trusted networks only.
+
+## The phone client
+
+A phone that opens a hosted deck gets `mobile.html` (`src/renderer/collab/mobile.ts`)
+instead of the editor: `main.ts` redirects when `mobileShell.ts` decides it is
+a phone (a coarse pointer and a screen under 600 px on its short side), and
+`?desktop=1` / `?mobile=1` or the shells' own menu entries choose for good.
+It edits nothing on a slide. It reads the deck through the same store and
+bridge as the editor, so the only things it writes are speaker notes (the
+notes drawer, docked) and comments (the comment threads, docked, plus an
+overview of every thread in the deck). Its rail is the editor's `SlideRail`
+with `readOnly`. On its side the rail is down the left and the notes or
+comments sit beside the slide; held upright the rail is a strip under the
+slide. It presents through the same overlay as the editor, and its **Agent**
+button copies the same prompt. Its hello carries `device: 'phone'`.
+
+## The remote
+
+Whoever presents can hand a slide clicker to anybody else who has the deck
+open, usually their own phone (`src/renderer/collab/remoteControl.ts`).
+A presentation surface says `presenting: true` in its hello. **Remote…** in
+Speaker View, or the button that shows in the audience view while the mouse
+moves (also the R key), lists the people in the room. Choosing one sends
+`remote-offer`. Their page asks them, and a yes (`remote-answer`) turns it
+into the remote view: the shared Speaker View with thumb-sized buttons,
+swipes and the screen kept awake. Its clicks (`remote-command`: next, prev,
+blank, go to) go to the offering surface, which runs them as its own keys
+would. Every move goes back as `remote-state`. The server keeps the pairs
+(`Room.remotes`) and relays a command only along one the presenter offered
+and the remote accepted. `remote-end` from either side, or either socket
+closing, ends it. Nothing about it is persisted.

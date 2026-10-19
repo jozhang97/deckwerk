@@ -119,6 +119,7 @@ export function capabilities(): Capability[] {
         'inspect reports the size it settled on as text.fittedFontSize.',
         'noWrap: true disables automatic line wrapping — lines break only where the author wrote one — and implies the auto-fit shrink for overlong lines.',
         "noWrapMode picks how a no-wrap line is compressed: 'shrink' (default) reduces the font size uniformly; 'condense' keeps the size and squeezes the type horizontally.",
+        'autoSize: true makes the box hug its text: lines break only where the author wrote one, and the editor keeps w/h at the text’s laid-out size, anchored at the edge its align names and at the top — a label rather than a column of prose. Resizing the box by hand turns it back into an ordinary wrapping box. It implies no auto-fit.',
       ],
       elements: [
         text('cap-fit-title', 'Auto-fit', TITLE, { class: ['role-title'] }),
@@ -276,7 +277,11 @@ export function capabilities(): Capability[] {
       notes: [
         'An arrow’s `control` is an absolute canvas-space point making it a quadratic curve.',
         'shape: "path" carries real SVG path data, scaled from pathSize to the element box — this is how imported vector art keeps its geometry.',
-        'arrowStart/arrowEnd put heads on a line or arrow at either end, or both.',
+        'arrowStart/arrowEnd put heads on a line or arrow at either end, or both. arrowSize sets the head length in pixels (unset: six stroke widths; never less than the line width, which ends the line in a point), so a thick line can keep a modest head. In HTML: data-arrow-size.',
+        'A curly brace is shape: "brace", laid out like a line (endpoints at the box\'s left and right centre, rotated by rot). braceDepth is the signed distance from the chord to the point along the element\'s own +y (down when unrotated); half of it is the radius of every curl. In HTML: data-shape="brace" data-brace-depth="40".',
+        'A drop shadow is CSS on the element: style: { filter: "drop-shadow(0px 8px 24px rgba(0, 0, 0, 0.3))" }. It follows the shape’s own paint (a line or an outline casts the shadow of its strokes), and Props → Shadow edits the same value.',
+        'A gradient fill: fillGradient: { to: "#ec6b14", angle: 270, kind: "linear" } runs from fill to `to`; angle is degrees counter-clockwise from the right (270 = top to bottom); kind "radial" spreads from the centre. In HTML: data-fill-to, data-fill-angle, data-fill-gradient.',
+        'A curved (paper) shadow, the object lifting at its bottom corners: style custom properties --curl-color, --curl-blur and --curl-lift (px). Props → Shadow → Style: Curved edits them.',
       ],
       elements: [
         text('cap-shape-title', 'Shapes and connectors', TITLE, { class: ['role-title'] }),
@@ -321,6 +326,7 @@ export function capabilities(): Capability[] {
         'Objects with no build are visible from the start.',
         "An appear with value: 'byParagraph' on a text element reveals it one paragraph (or list item) at a time, in document order — one click each, or a cascade when triggered afterPrev/withPrev.",
         'withPrev fires together with the step before it; afterPrev fires on its own after that step, with an optional delay in ms.',
+        'An appear or disappear with value: \'dissolve\' fades the element in or out; an appear with value: \'draw\' on a shape is Line Draw: a line or arrow grows from its start with its head leading, and a box, ellipse or path is traced along its outline with its fill following. action.duration is the time in ms (defaults 1000 and 600), and an afterPrev build waits for an animated one before it to finish. In authoring HTML: data-build="click" data-build-effect="dissolve" data-build-duration="800". Animations play when a step is reached by advancing (including builds that run on arriving at a slide); jumping to a step shows its finished state.',
         "The other actions are disappear, play/pause (media), seek (value: seconds) and addClass/removeClass (value: the class name) — the last two are the hook for anything theme.css can animate.",
       ],
       elements: [
@@ -426,8 +432,9 @@ export function capabilities(): Capability[] {
       what: 'Review comments, on a slide or on a single object.',
       when: 'Humans leave you instructions here. Read them first, reply, resolve what you finish.',
       notes: [
-        'comments: [{id, author, text, ts, resolved}] lives on a slide and on any element.',
-        'CLI: `slide-agent comments <deck>` lists every comment with its 1-based slide number; --resolve <id> marks one done; --add <text> --slide/--element <id> replies.',
+        'comments: [{id, author, text, ts, resolved, parentId?}] lives on a slide and on any element. A thread is a root comment and the replies whose parentId names it; the root’s resolved is the thread’s.',
+        'CLI: `slide-agent comments <deck>` lists every comment with its 1-based slide number; --resolve <id> marks its thread done; --add <text> --reply <id> answers in a thread; --add <text> --slide/--element <id> starts one.',
+        'Comments change only through the updateComments operation, which merges by comment id; replaceElement, replaceSlide and setSlideProperties leave a target’s comments alone.',
         'In a live collaboration session: await window.agent.seeComments() and await window.agent.resolveComment(id); GET /api/comments serves the same rows.',
         'Resolve what you acted on. Never delete a human’s comment.',
       ],
@@ -457,7 +464,8 @@ export function capabilities(): Capability[] {
         'Import a complete HTML document with `slide-agent web import <deck> page.html [--after <slideId>] [--title <text>]`; it lands in assets/web/, content-hashed, as a full-canvas slide. The JSON reply names the src.',
         'In an authoring page, `<div data-element="web" data-src="assets/web/page.a1b2c3d4.html" data-title="…" style="width:…;height:…"></div>` places one anywhere; its CSS box is its geometry like any element.',
         'The page runs in an iframe with sandbox="allow-scripts": scripts yes, but no access to the deck, the app, other slides, the network at presentation time (author with inlined data and assets), popups or navigation. Remote URLs are refused.',
-        'The import writes a small runtime that exposes window.deckwerk — onActive(fn), onInactive(fn), onStep(fn), next(), prev() — and forwards unhandled arrow/space keys so a focused page never traps the presenter.',
+        'The import writes a small runtime that exposes window.deckwerk — onActive(fn), onInactive(fn), onStep(fn), next(), prev(), ready(promise) — and forwards unhandled arrow/space keys so a focused page never traps the presenter.',
+        'While presenting, the page is hidden behind its poster until it has loaded and painted. A page that lays itself out from script after load calls `deckwerk.ready(promise)` from its top-level script and the deck also waits for that promise (at most 5 s).',
         'Design for the element box (usually the 1920×1080 canvas) with no scrolling. Clicks inside the page go to the page while `interactive` is true; set it false to have them advance the deck.',
         'Nothing inside the page is a slide object: it cannot be restyled with the inspector, Morphed, or auto-fitted. Set `poster` to a still for PDF export and thumbnails.',
       ],

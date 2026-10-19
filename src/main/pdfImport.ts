@@ -7,7 +7,7 @@ export async function convertPdfToSvg(
   destination: string,
 ): Promise<{ width: number; height: number }> {
   const sidecar = resolveKeynoteSidecar();
-  if (!sidecar) throw new Error('PDF converter not found. Run npm run setup:importer in development.');
+  if (!sidecar) throw new Error('PDF converter not found. Run npm run setup:importers in development.');
   const { stdout } = await runImporterSidecar('PDF', sidecar.command, [
     ...sidecar.args, source, '--pdf-figure', '--out', destination,
   ]);

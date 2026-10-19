@@ -210,6 +210,20 @@ describe('text formatting from the inspector controls', () => {
     document.body.replaceChildren();
   });
 
+  it('sizes a box to its text from the inspector, turning auto-fit off with it', () => {
+    const { store, inspectorHost } = setup([textElement('text-1', { autoFit: true })]);
+    const toggle = () => field(inspectorHost, 'Size box to text')
+      .querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    expect(toggle().checked).toBe(false);
+
+    toggle().click();
+    expect(store.slide!.elements[0]).toMatchObject({ autoSize: true, autoFit: false });
+    expect(toggle().checked).toBe(true);
+
+    toggle().click();
+    expect(store.slide!.elements[0]).not.toHaveProperty('autoSize');
+  });
+
   it('keeps the exhaustive formatting matrix synchronized with the shipped text and table controls', () => {
     const normal = setup([textElement('text-1', { html: '<p>First</p><p>Second</p>' })]);
     normal.canvas.beginTextEdit('text-1');
@@ -220,11 +234,12 @@ describe('text formatting from the inspector controls', () => {
       'Role', 'Font family', 'Font size', 'Font weight', 'Style', 'Colour',
     ]);
     expect(labels('.text-layout-options .field > span')).toEqual([
-      'Auto-fit text to box', 'Disable automatic line breaks', 'List',
-      'Align', 'Vertical', 'Paragraph spacing',
+      'Size box to text', 'Auto-fit text to box', 'Disable automatic line breaks', 'List',
+      'Align', 'Vertical', 'Paragraph spacing', 'Line spacing',
     ]);
     expect(labels('.text-format-buttons button')).toEqual(['B', 'I', 'U', 'x²', 'x₂']);
-    expect(labels('.number-step-buttons button')).toEqual(['▲', '▼', '▲', '▼', '▲', '▼']);
+    expect(labels('.number-step-buttons button'))
+      .toEqual(['▲', '▼', '▲', '▼', '▲', '▼', '▲', '▼']);
 
     const table = setup([textElement('table-1', {
       html: '<table><tbody><tr><td>A</td><td>B</td></tr>'
@@ -316,13 +331,19 @@ describe('text formatting from the inspector controls', () => {
     type(picker.querySelector<HTMLInputElement>('input[aria-label="Hex color"]')!, '#3366cc');
     expect(textOf(store, 'text-1').style.color).toBe('#3366cc');
 
-    // Dragging the opacity slider previews live and commits when released.
+    // Dragging the opacity slider applies every step as it goes, and the
+    // whole drag is one undo step.
     const opacity = picker.querySelector<HTMLInputElement>('input[aria-label="Opacity"]')!;
+    opacity.value = '70';
+    opacity.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(textOf(store, 'text-1').style.color).toBe('rgba(51, 102, 204, 0.7)');
     opacity.value = '50';
     opacity.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(textOf(store, 'text-1').style.color).toBe('#3366cc');
+    expect(textOf(store, 'text-1').style.color).toBe('rgba(51, 102, 204, 0.5)');
     opacity.dispatchEvent(new Event('change', { bubbles: true }));
     expect(textOf(store, 'text-1').style.color).toBe('rgba(51, 102, 204, 0.5)');
+    store.undo();
+    expect(textOf(store, 'text-1').style.color).toBe('#3366cc');
   });
 
   it('turns paragraphs into a bulleted list and back from the list dropdown', () => {
@@ -1547,6 +1568,107 @@ describe('text formatting from the inspector controls', () => {
     expect(nodeOf(canvasHost, 'text-1').dataset.paragraphSpacing).toBeUndefined();
   });
 
+  it('sets and clears the box line spacing as a ratio, showing the theme value when unset', () => {
+    const { store, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: '<p>First</p><p style="line-height: 2">Second</p>' }),
+    ]);
+    const spacing = () => field(inspectorHost, 'Line spacing');
+    const input = () => spacing().querySelector<HTMLInputElement>('input')!;
+    expect(input().step).toBe('0.05');
+    expect(input().min).toBe('0.5');
+    expect(input().max).toBe('4');
+
+    type(input(), '1.6');
+    const element = textOf(store, 'text-1');
+    expect(element.style['line-height']).toBe('1.6');
+    expect(element.overrides).toContain('line-height');
+    // The box has one spacing afterwards: a paragraph's own goes with it.
+    expect(element.html).toBe('<p>First</p><p>Second</p>');
+    expect(contentOf(canvasHost, 'text-1').style.lineHeight).toBe('1.6');
+    expect(input().value).toBe('1.6');
+    expect(store.history().at(-1)?.label).toBe('Change line spacing');
+
+    // Out of range is clamped rather than stored.
+    type(input(), '9');
+    expect(textOf(store, 'text-1').style['line-height']).toBe('4');
+
+    spacing().querySelector<HTMLButtonElement>('.icon-button')!.click();
+    expect(textOf(store, 'text-1').style['line-height']).toBeUndefined();
+    expect(textOf(store, 'text-1').overrides ?? []).not.toContain('line-height');
+    expect(contentOf(canvasHost, 'text-1').style.lineHeight).toBe('');
+  });
+
+  it('sets line spacing on only the paragraphs a text selection touches', () => {
+    const original = '<p>First paragraph</p><p>Second paragraph</p><p>Third</p>';
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: original }),
+    ]);
+    canvas.beginTextEdit('text-1');
+    const content = contentOf(canvasHost, 'text-1');
+    const paragraphs = () => [...content.querySelectorAll<HTMLParagraphElement>('p')];
+    const range = document.createRange();
+    range.setStart(paragraphs()[0].firstChild!, 6);
+    range.setEnd(paragraphs()[1].firstChild!, 3);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const input = field(inspectorHost, 'Line spacing').querySelector<HTMLInputElement>('input')!;
+    content.dispatchEvent(new FocusEvent('blur', { relatedTarget: input }));
+    type(input, '1.75');
+
+    expect(paragraphs().map((p) => p.style.lineHeight)).toEqual(['1.75', '1.75', '']);
+    expect(textOf(store, 'text-1').style['line-height']).toBeUndefined();
+    expect(field(inspectorHost, 'Line spacing').querySelector<HTMLInputElement>('input')!.value)
+      .toBe('1.75');
+    expect(canvas.isEditing()).toBe(true);
+    content.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'z', ctrlKey: true, bubbles: true, cancelable: true,
+    }));
+    expect(textOf(store, 'text-1').html).toBe(original);
+  });
+
+  it('writes a size that covers whole paragraphs on the paragraphs, so their lines follow', () => {
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', {
+        html: '<p>First <b style="font-size: 30px">bold</b> line</p><p><br></p>'
+          + '<p>Second x<sup style="font-size: 0.7em">2</sup></p><p>Third line</p>',
+      }),
+    ]);
+    canvas.beginTextEdit('text-1');
+    const content = contentOf(canvasHost, 'text-1');
+    const blocks = () => [...content.querySelectorAll<HTMLParagraphElement>('p')];
+    // From the start of the first paragraph into the middle of the last.
+    const range = document.createRange();
+    range.setStart(blocks()[0].firstChild!, 0);
+    range.setEnd(blocks()[3].firstChild!, 5);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const input = field(inspectorHost, 'Font size').querySelector<HTMLInputElement>('input')!;
+    content.dispatchEvent(new FocusEvent('blur', { relatedTarget: input }));
+    type(input, '14');
+
+    const saved = document.createElement('div');
+    saved.innerHTML = textOf(store, 'text-1').html;
+    const [first, empty, second, third] = [...saved.querySelectorAll<HTMLElement>('p')];
+    // Whole paragraphs (and the empty line between them) carry the size, and
+    // their runs no longer repeat it -- not even the bold run's old 30px.
+    expect(first.style.fontSize).toBe('14px');
+    expect(first.querySelectorAll('[style*="font-size"]')).toHaveLength(0);
+    expect(first.textContent).toBe('First bold line');
+    expect(empty.style.fontSize).toBe('14px');
+    expect(second.style.fontSize).toBe('14px');
+    // The superscript is a proportion of what it sits next to, and still is.
+    expect(second.querySelector<HTMLElement>('sup')!.style.fontSize).toBe('0.7em');
+    // Only "Third" of the last paragraph was selected: one word does not
+    // tighten the line it sits on, so the paragraph keeps its own size.
+    expect(third.style.fontSize).toBe('');
+    expect(third.querySelector<HTMLElement>('span')!.textContent).toBe('Third');
+    expect(third.querySelector<HTMLElement>('span')!.style.fontSize).toBe('14px');
+  });
+
   it('assigns the semantic type role that theme.css and Cast fonts target', () => {
     const { store, canvasHost, inspectorHost } = setup([textElement('text-1')]);
     const role = () => field(inspectorHost, 'Role').querySelector('select')!;
@@ -1613,6 +1735,21 @@ describe('text formatting across a multi-selection', () => {
     type(spacing(), '24');
     expect(['text-1', 'text-2'].map((id) => textOf(store, id).paragraphSpacing))
       .toEqual([24, 24]);
+  });
+
+  it('shows mixed line spacing across boxes, then sets one ratio on all of them', () => {
+    const { store, inspectorHost } = setup([
+      textElement('text-1', { style: { 'line-height': '1.2' } }),
+      textElement('text-2', { y: 400, style: { 'line-height': '1.5' } }),
+    ]);
+    const input = () => field(inspectorHost, 'Line spacing').querySelector<HTMLInputElement>('input')!;
+    expect(input().placeholder).toBe('Mixed');
+    expect(input().value).toBe('');
+
+    type(input(), '1.3');
+    expect(['text-1', 'text-2'].map((id) => textOf(store, id).style['line-height']))
+      .toEqual(['1.3', '1.3']);
+    expect(input().value).toBe('1.3');
   });
 
   it('bullets a whole multi-selection from the shared list dropdown', () => {

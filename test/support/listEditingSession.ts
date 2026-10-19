@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect } from 'vitest';
@@ -12,6 +12,7 @@ import {
   launchBrowser,
   stopBrowser,
   textEditingState,
+  installEditingTrace,
   wait,
   type RunningBrowser,
 } from './browserSession.js';
@@ -212,11 +213,104 @@ export const RUN_FORMATS = `((text, root) => {
   };
 })`;
 
+/** The list box's geometry, style and auto-fit, for walks in boxes of other shapes. */
+export interface BoxShape {
+  h: number;
+  style: Record<string, string>;
+  autoFit: boolean;
+}
+
+/** The shared list box: tall enough that nothing typed in a test overflows it. */
+export const BOX_DEFAULTS: BoxShape = { h: 860, style: {}, autoFit: false };
+
+/**
+ * The type-size oracle, run in the page. Waits two frames, so a fit that an
+ * edit scheduled has run before anything is read.
+ */
+const TYPE_SIZE_PROBLEMS = `((selector) => new Promise((resolve) => {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const root = document.querySelector(selector);
+    const node = root?.closest('.element');
+    const body = root?.parentElement;
+    if (!root || !node || !body) return resolve(['the text box is gone']);
+    const own = Number.parseFloat(getComputedStyle(node).fontSize);
+    const problems = [];
+    const runs = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      const words = text.data.replace(/[\\s\\u00a0\\u200b\\u2060]+/g, '');
+      if (words) runs.push([words, Number.parseFloat(getComputedStyle(text.parentElement).fontSize)]);
+    }
+    const wrongRuns = (expected, why) => {
+      for (const [words, size] of runs) {
+        if (Math.abs(size - expected) > 0.05) problems.push(JSON.stringify(words) + ' is ' + size + 'px, ' + why);
+      }
+    };
+    if (node.dataset.autoFit !== 'true') {
+      if (root.dataset.fittedFontSize !== undefined) {
+        problems.push('a box without auto-fit was fitted to ' + root.dataset.fittedFontSize + 'px');
+      }
+      if (root.style.fontSize) problems.push('a box without auto-fit carries font-size ' + root.style.fontSize);
+      wrongRuns(own, 'the box without auto-fit is ' + own + 'px');
+    } else {
+      const fitted = Number.parseFloat(root.dataset.fittedFontSize ?? '');
+      if (!Number.isFinite(fitted)) problems.push('the auto-fit box was never fitted');
+      else {
+        if (fitted > own + 0.05) problems.push('fitted to ' + fitted + 'px, above its own ' + own + 'px');
+        wrongRuns(fitted, 'the box was fitted to ' + fitted + 'px');
+        // At the 6px floor there is nothing smaller to try.
+        const overflows = root.scrollHeight > body.clientHeight + 1 || root.scrollWidth > body.clientWidth + 1;
+        if (overflows && fitted > 6.05) {
+          problems.push('fitted to ' + fitted + 'px and still overflows: ' + root.scrollWidth + 'x'
+            + root.scrollHeight + ' in ' + body.clientWidth + 'x' + body.clientHeight);
+        }
+      }
+    }
+    resolve(problems);
+  }));
+}))`;
+
+/**
+ * Collect what the render-invariant checker reports. It only writes to the
+ * console, which no test reads, so wrap `console.error` in the page.
+ */
+async function captureRenderDivergences(cdp: Cdp): Promise<void> {
+  await cdp.evaluate(`(() => {
+    if (window.__renderDivergences) return true;
+    window.__renderDivergences = [];
+    const original = console.error.bind(console);
+    console.error = (...args) => {
+      if (typeof args[0] === 'string' && args[0].startsWith('[render-invariant]')) {
+        window.__renderDivergences.push(args[0] + ' ' + JSON.stringify(args.slice(1)));
+      }
+      original(...args);
+    };
+    return true;
+  })()`);
+}
+
 export interface ListEditingSession {
   cdp: Cdp;
   port: number;
   /** Replace the box's markup. Fixture setup only — never the thing tested. */
   reset(html: string): Promise<void>;
+  /**
+   * Resize the box and set its style and auto-fit, leaving editing first.
+   * Fixture setup only; `BOX_DEFAULTS` puts the shared box back.
+   */
+  shapeBox(box: BoxShape): Promise<void>;
+  /**
+   * What is wrong with the type size of `selector`'s box (default: the list
+   * box), read after a scheduled fit has run. A box without auto-fit keeps its
+   * own size on every run and carries no fit residue; an auto-fit box shows
+   * every run at the size it fitted, no larger than its own, and fits.
+   */
+  typeSizeProblems(selector?: string): Promise<string[]>;
+  /**
+   * What the canvas's render-invariant checker reported since the last call:
+   * a patched node that no longer matches a fresh render of the deck.
+   */
+  renderDivergences(): Promise<string[]>;
   /** Enter text editing with a real double-click. */
   edit(): Promise<void>;
   /** Click the glyph at a flat text offset, putting a real caret there. */
@@ -276,7 +370,14 @@ export interface ListEditingSession {
   undo(): Promise<void>;
 }
 
-export async function startListEditingSession(deckId: string, name: string): Promise<{
+/**
+ * `textStyle` is the list box's style as it is saved on disk before the app
+ * opens the deck -- what a deck written by an importer looks like on load,
+ * which a later `shapeBox` (a live store commit) cannot reproduce.
+ */
+export async function startListEditingSession(deckId: string, name: string, options: {
+  textStyle?: Record<string, string>;
+} = {}): Promise<{
   session: ListEditingSession;
   close: () => Promise<void>;
 }> {
@@ -299,6 +400,14 @@ export async function startListEditingSession(deckId: string, name: string): Pro
     html: OTHER_HTML, align: 'left', valign: 'top',
   } as never);
   await saveDeck(deckDir, deck);
+  if (options.textStyle) {
+    // Written past saveDeck, which would put the style through the schema:
+    // the point is the bytes an older app or an importer left on disk.
+    const saved = JSON.parse(await readFile(join(deckDir, 'deck.json'), 'utf8')) as Deck;
+    const element = saved.slides[0].elements.find((candidate) => candidate.id === TEXT_ID)!;
+    element.style = options.textStyle;
+    await writeFile(join(deckDir, 'deck.json'), `${JSON.stringify(saved, null, 2)}\n`, 'utf8');
+  }
   await writeFile(join(deckDir, 'theme.css'), [
     '.slide { background: #fff; color: #111827; }',
     '.role-body { font: 400 28px/1.4 sans-serif; }',
@@ -321,6 +430,8 @@ export async function startListEditingSession(deckId: string, name: string): Pro
   await eventually(async () => cdp!.evaluate<boolean>(
     `Boolean(document.querySelector('${CONTENT}'))`), 'the list fixture never loaded');
   await cdp.click('#side-tabs button[data-panel="inspector"]', 'Props tab');
+  await installEditingTrace(cdp);
+  await captureRenderDivergences(cdp);
 
   const port = server.port;
   const session = buildSession(cdp, port, deckId);
@@ -354,22 +465,51 @@ function buildSession(cdp: Cdp, port: number, deckId: string): ListEditingSessio
     return outline(root);
   })()`);
 
+  const leaveEditing = async (): Promise<void> => {
+    if (!await cdp.evaluate<boolean>(
+      `document.querySelector('${CONTENT}')?.isContentEditable === true`,
+    )) return;
+    // Its first character, not its centre: text that overflows a short box
+    // centres below the box's bottom edge, on the resize handle there.
+    const hasGlyphs = await cdp.evaluate<boolean>(
+      `((document.querySelector('${CONTENT}')?.textContent ?? '').trim().length > 0)`);
+    if (hasGlyphs) await cdp.clickTextAtOffset(CONTENT, 0, 'the text box before leaving editing');
+    else await cdp.click(CONTENT, 'the text box before leaving editing');
+    await cdp.key('Escape', 27);
+    await eventually(async () => cdp.evaluate<boolean>(
+      `document.querySelector('${CONTENT}')?.isContentEditable !== true`,
+    ), 'Escape did not leave text editing');
+  };
+
   const session: ListEditingSession = {
     cdp,
     port,
+    async shapeBox(box) {
+      await leaveEditing();
+      await cdp.evaluate(`(() => {
+        window.store.commit((deck) => {
+          const element = deck.slides[0].elements.find(
+            (candidate) => candidate.id === ${JSON.stringify(TEXT_ID)});
+          element.h = ${box.h};
+          element.style = ${JSON.stringify(box.style)};
+          if (${box.autoFit}) element.autoFit = true;
+          else delete element.autoFit;
+        }, { label: 'List editing fixture' });
+        return true;
+      })()`);
+    },
+    typeSizeProblems(selector = CONTENT) {
+      return cdp.evaluate<string[]>(`${TYPE_SIZE_PROBLEMS}(${JSON.stringify(selector)})`);
+    },
+    renderDivergences() {
+      return cdp.evaluate<string[]>(
+        `(window.__renderDivergences ?? ['the checker capture is not installed']).splice(0)`);
+    },
     async reset(html) {
       // Fixture setup, not an interaction: leave editing, then write the
       // markup the scenario starts from straight into the store. The canvas
       // does not patch the element being edited, so this has to come first.
-      if (await cdp.evaluate<boolean>(
-        `document.querySelector('${CONTENT}')?.isContentEditable === true`,
-      )) {
-        await cdp.click(CONTENT, 'the text box before leaving editing');
-        await cdp.key('Escape', 27);
-        await eventually(async () => cdp.evaluate<boolean>(
-          `document.querySelector('${CONTENT}')?.isContentEditable !== true`,
-        ), 'Escape did not leave text editing');
-      }
+      await leaveEditing();
       await cdp.evaluate(`(() => {
         window.store.commit((deck) => {
           const element = deck.slides[0].elements.find(
@@ -384,9 +524,36 @@ function buildSession(cdp: Cdp, port: number, deckId: string): ListEditingSessio
     async edit() {
       // A box whose every line is empty has no glyph to aim at; its own box
       // is still there to double-click.
-      const hasGlyphs = await cdp.evaluate<boolean>(
-        `((document.querySelector('${CONTENT}')?.textContent ?? '').trim().length > 0)`);
-      if (hasGlyphs) await cdp.doubleClickText(CONTENT, 'text box');
+      // The first click selects the box and puts its resize handles up, so
+      // the glyph aimed at must be clear of where they will be: in a short
+      // box the first glyph sits right on the top-left handle.
+      const offset = await cdp.evaluate<number>(`(() => {
+        const root = document.querySelector('${CONTENT}');
+        const box = root?.closest('.element')?.getBoundingClientRect();
+        if (!root || !box) return -1;
+        const handles = [0, 0.5, 1].flatMap((fx) => [0, 0.5, 1]
+          .filter((fy) => fx !== 0.5 || fy !== 0.5)
+          .map((fy) => [box.left + box.width * fx, box.top + box.height * fy]));
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let flat = 0;
+        let first = -1;
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          for (let i = 0; i < node.data.length; i++) {
+            if (/\\s/.test(node.data[i])) continue;
+            if (first < 0) first = flat + i;
+            const range = document.createRange();
+            range.setStart(node, i);
+            range.setEnd(node, i + 1);
+            const r = range.getBoundingClientRect();
+            const x = r.left + r.width / 2;
+            const y = r.top + r.height / 2;
+            if (handles.every(([hx, hy]) => Math.hypot(hx - x, hy - y) > 20)) return flat + i;
+          }
+          flat += node.data.length;
+        }
+        return first;
+      })()`);
+      if (offset >= 0) await cdp.doubleClickTextAtOffset(CONTENT, offset, 'text box');
       else await cdp.doubleClick(CONTENT, 'text box with no text');
       try {
         await eventually(async () => cdp.evaluate<boolean>(

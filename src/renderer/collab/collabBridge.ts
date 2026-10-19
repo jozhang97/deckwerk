@@ -3,15 +3,21 @@ import { setMediaVariants } from './mediaVariants.js';
 import type { AgentOperation } from '@shared/agent.js';
 import { applyOpsLenient } from '@shared/collabApply.js';
 import {
+  COLLAB_CLOSE,
   COLLAB_PROTOCOL_VERSION,
   ServerMessageSchema,
   type ClientMessage,
+  type ClientRemoteMessage,
   type CursorPosition,
   type PresenceState,
+  type ServerDeckMovedMessage,
+  type ServerRemoteMessage,
   type ServerWelcomeMessage,
 } from '@shared/collab.js';
+import type { ChatMessage, ChatRef } from '@shared/chat.js';
 import type { Deck } from '@shared/deck.js';
 import { diffDecks } from '@shared/deckDiff.js';
+import { withoutCommentOps } from '@shared/comments.js';
 import { makeId } from '@shared/geometry.js';
 import type { RemoteHistoryOptions } from '../editor/store.js';
 
@@ -54,11 +60,27 @@ export interface CollabBridgeHooks {
   onPeerCursor: (clientId: string, cursor: CursorPosition | null) => void;
   onPeerLeft: (clientId: string) => void;
   onThemeCss: (css: string) => void;
+  /** One accepted chat message, including the echo of this client's own. */
+  onChat?: (message: ChatMessage) => void;
   onStatus: (text: string) => void;
   /** True while no local transaction is awaiting confirmation. */
   onCleanChange: (clean: boolean) => void;
   /** The host ended the session; the bridge stops reconnecting. */
   onEnded?: () => void;
+  /**
+   * The deck was renamed while open, so its id — the room this socket joined
+   * — is gone. The bridge stops reconnecting to the old id; the shell follows
+   * the deck to `moved.deckId`. `unsent` counts local transactions the server
+   * never applied: it stops accepting edits for the room before it renames
+   * the folder, so these did not survive.
+   */
+  onMoved?: (moved: ServerDeckMovedMessage, unsent: number) => void;
+  /**
+   * The server has no deck by this id (deleted, or renamed while this client
+   * was away and the server no longer remembers where to). Retrying cannot
+   * help, so the bridge stops and says why.
+   */
+  onUnavailable?: (reason: string) => void;
   /**
    * False the moment the socket drops (a retry loop begins), true again on
    * every welcome. Distinct from onStatus so callers can drive UI state
@@ -71,6 +93,14 @@ export interface CollabBridgeHooks {
    * tell the user that work done while disconnected did not survive.
    */
   onEditsDiscarded?: (count: number) => void;
+  /** A message about the remote (remoteControl.ts), from the one peer it is shared with. */
+  onRemote?: (message: ServerRemoteMessage) => void;
+}
+
+/** How this peer introduces itself beyond its name: see PresenceState. */
+export interface CollabSurface {
+  presenting?: boolean;
+  device?: 'phone';
 }
 
 export class CollabBridge {
@@ -85,6 +115,7 @@ export class CollabBridge {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private participant: string | undefined;
+  private surface: CollabSurface = {};
 
   constructor(
     private readonly url: string,
@@ -110,6 +141,11 @@ export class CollabBridge {
     this.participant = participant;
   }
 
+  /** Say what kind of peer this is in the hello. Set before connect(). */
+  setSurface(surface: CollabSurface): void {
+    this.surface = surface;
+  }
+
   connect(): void {
     this.closed = false;
     const socket = new WebSocket(this.url);
@@ -121,6 +157,8 @@ export class CollabBridge {
         version: COLLAB_PROTOCOL_VERSION,
         name: this.name,
         ...(this.participant ? { participant: this.participant } : {}),
+        ...(this.surface.presenting ? { presenting: true } : {}),
+        ...(this.surface.device ? { device: this.surface.device } : {}),
       });
     });
     socket.addEventListener('message', (event) => {
@@ -139,6 +177,15 @@ export class CollabBridge {
       if (event.code === 4003) {
         this.closed = true;
         this.hooks.onStatus(event.reason || 'You no longer have access to this presentation');
+        return;
+      }
+      // A deck that is not there (or was renamed: that close follows a
+      // `deckMoved`, which already stopped the bridge) is not a network blip.
+      if (event.code === COLLAB_CLOSE.noSuchDeck || event.code === COLLAB_CLOSE.moved) {
+        this.closed = true;
+        const reason = event.reason || 'This presentation no longer exists';
+        this.hooks.onStatus(reason);
+        this.hooks.onUnavailable?.(reason);
         return;
       }
       this.hooks.onStatus(`Disconnected — retrying in ${Math.round(this.reconnectDelay / 1000)}s`);
@@ -173,25 +220,29 @@ export class CollabBridge {
   localEdit = (prev: Deck, next: Deck, label: string, coalesceKey?: string): void => {
     const forward = diffDecks(prev, next);
     if (forward.length === 0) return;
-    const inverse = diffDecks(next, prev);
-    if (!this.replayingHistory) {
+    // Comment changes go to the server but never onto the undo stack, and
+    // undo never takes one back (shared/comments.ts).
+    const undoForward = withoutCommentOps(forward);
+    const inverse = withoutCommentOps(diffDecks(next, prev));
+    if (!this.replayingHistory && undoForward.length > 0) {
       const top = this.undoStack[this.undoStack.length - 1];
       if (coalesceKey && top?.coalesceKey === coalesceKey) {
         // Op lists compose by concatenation: forward replays oldest→newest,
         // inverse newest→oldest, so undoing lands on the session's start.
         top.label = label;
-        top.forward.push(...forward);
+        top.forward.push(...undoForward);
         top.inverse.unshift(...inverse);
       } else {
-        this.undoStack.push({ label, forward, inverse, coalesceKey });
+        this.undoStack.push({ label, forward: undoForward, inverse, coalesceKey });
         if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift();
       }
       this.redoStack = [];
     }
+    const ops = withTextBases(prev, forward);
     const txnId = makeId('txn');
-    this.pending.push({ txnId, label, ops: forward });
+    this.pending.push({ txnId, label, ops });
     this.hooks.onCleanChange(false);
-    this.send({ kind: 'txn', txnId, baseSeq: this.seq, label, ops: forward });
+    this.send({ kind: 'txn', txnId, baseSeq: this.seq, label, ops });
   };
 
   undo(currentDeck: Deck): void {
@@ -231,6 +282,23 @@ export class CollabBridge {
 
   sendTheme(css: string): void {
     this.send({ kind: 'theme', css });
+  }
+
+  /**
+   * Post to the deck chat. Fire-and-forget: the caller shows the message as
+   * pending under `id` and confirms it when the `chat` echo carries that id.
+   * Returns false while disconnected, so the caller can resend after the
+   * next welcome (the server ignores an id it already accepted).
+   */
+  sendChat(post: { id: string; text: string; ref?: ChatRef }): boolean {
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.send({ kind: 'chat-post', ...post });
+    return true;
+  }
+
+  /** Relay a remote message; dropped while disconnected, like presence. */
+  sendRemote(message: ClientRemoteMessage): void {
+    this.send(message);
   }
 
   private seq = 0;
@@ -361,13 +429,57 @@ export class CollabBridge {
       case 'media':
         setMediaVariants(message.variants);
         return;
+      case 'chat':
+        this.hooks.onChat?.(message.message);
+        return;
+      case 'remote-offer':
+      case 'remote-answer':
+      case 'remote-command':
+      case 'remote-state':
+      case 'remote-end':
+        this.hooks.onRemote?.(message);
+        return;
       case 'ended':
         // Deliberate teardown, not a network blip: don't reconnect.
         this.closed = true;
         this.hooks.onEnded?.();
         return;
+      case 'deckMoved': {
+        // The server closes this socket next. Reconnecting to the old id
+        // would find nothing there, so stop now. Messages arrive in order, so
+        // anything still pending here was sent after the server stopped
+        // applying edits to the room: it was dropped, not merely unconfirmed.
+        this.closed = true;
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = null;
+        }
+        this.hooks.onMoved?.(message, this.pending.length);
+        return;
+      }
     }
   }
+}
+
+/**
+ * Stamp every replacement of a text-bearing element with the html it was
+ * edited from, so the server — and every replica replaying the same stream —
+ * merges it with a collaborator's concurrent typing in that box instead of
+ * overwriting it (collabApply, textMerge.ts). Live text sync streams whole
+ * boxes; two people typing in one box cross pushes constantly.
+ *
+ * Only what goes on the wire (and the pending replay of it) carries the base.
+ * Undo and redo entries stay plain replacements.
+ */
+function withTextBases(prev: Deck, ops: AgentOperation[]): AgentOperation[] {
+  return ops.map((op) => {
+    if (op.op !== 'replaceElement' || !('html' in op.element)) return op;
+    const before = prev.slides
+      .find((slide) => slide.id === op.slideId)
+      ?.elements.find((element) => element.id === op.elementId);
+    if (!before || !('html' in before) || typeof before.html !== 'string') return op;
+    return { ...op, baseHtml: before.html };
+  });
 }
 
 /** Turn a terse API label plus structural operations into readable provenance. */

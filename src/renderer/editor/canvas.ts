@@ -1,5 +1,10 @@
 import { openContextMenu } from './contextMenuPlacement.js';
-import type { Deck, Slide, SlideElement } from '@shared/deck.js';
+import type { Deck, Slide, SlideElement, TextEl } from '@shared/deck.js';
+import { NEW_MEDIA_FIT } from '@shared/deck.js';
+import { lineSpacingValue } from '@shared/lineHeight.js';
+import { canHoldText, shapeToTextBox } from '@shared/shapeText.js';
+import { moveCorner, polygonPoints } from '@shared/polygonShape.js';
+import { braceDepthToward, bracePolyline, braceTip } from '@shared/brace.js';
 import { type Rect, fitScale, makeId } from '@shared/geometry.js';
 
 type XY = { x: number; y: number };
@@ -21,9 +26,12 @@ import { DecodedVideoPool, releaseDecodedVideo } from '../player/decodedVideoPoo
 import { ungateVideoLoad } from '../player/mediaLoadGate.js';
 import { openSlideLinkInNewTab, slideLinkFromEvent } from '../player/links.js';
 import { expandTimeline } from '@shared/timeline.js';
+import { mapTextOffset, mergeTextHtml } from '@shared/textMerge.js';
 import {
   BASELINE_RUN_FONT_SIZE, isRelativeFontSize, restoreKatexSourceHtml,
-  sanitizePastedTextHtml, stripLayoutDeclarations,
+  pastedHtmlHasMedia, sanitizePastedTextHtml, stripFittedFontSize, stripLayoutDeclarations,
+  stripTextMediaPayloads,
+  textOnlyPastedHtml,
 } from '@shared/htmlSafety.js';
 import { isBaselineFormat, type BaselineFormat, type InlineTextFormat } from './textFormatting.js';
 import { classifyMediaName, isPendingSrc, makePendingSrc, mediaFileName, pendingToken } from '@shared/media.js';
@@ -69,10 +77,19 @@ import {
 } from './pendingUploads.js';
 import { dragImageSource, type ClipboardImageSource } from '@shared/clipboardImages.js';
 import type { ImportedAsset } from '@shared/ipc.js';
-import { newComment, openCommentsPopover, openCount } from './comments.js';
+import { commentFocus, commentHighlightsShown, onCommentHighlightsChange, openComments } from './comments.js';
+import { openThreadCount } from '@shared/comments.js';
 import { reportRenderDivergences } from './renderInvariants.js';
+import { SpellingSession } from './spellcheck.js';
+
+/** A row of the canvas right-click menu. */
+type ContextMenuEntry =
+  | { label: string; action: () => void; checked?: boolean }
+  | { heading: string; title?: string }
+  | 'separator';
 import { isWebBridgeAction } from '@shared/webBridge.js';
 import { reportSelectionViolations } from './selectionInvariants.js';
+import { KeptSelectionHighlight, TEXT_EDIT_PANEL_CHROME } from './keptSelection.js';
 import {
   HANDLES,
   type SizeGuide,
@@ -84,7 +101,7 @@ import {
   snapResize,
   spacingGuides,
 } from './snapping.js';
-import { sameSlideIgnoringNotes, type EditorStore } from './store.js';
+import { sameSlideDrawing, type EditorStore } from './store.js';
 
 export type TableSelection = {
   elementId: string;
@@ -144,6 +161,8 @@ function isCommandModifierKey(key: string): boolean {
 }
 
 const SNAP_SCREEN_PX = 6;
+/** The smallest a resize handle makes a box, in canvas pixels. */
+const MIN_RESIZE = 8;
 /** Forgiving screen-space target around a visible line or arrow. */
 const LINE_HIT_SCREEN_PX = 8;
 /** Screen-pixel movement before a press becomes a drag rather than a click. */
@@ -389,6 +408,61 @@ function crossesBlocks(range: Range, body: HTMLElement): boolean {
   return start !== null && end !== null && start !== end;
 }
 
+/**
+ * Delete the typing-style sentinel from text nodes in place. `deleteData`
+ * rather than assigning `data`, so a live selection inside the text keeps
+ * its offsets.
+ */
+function deleteSentinels(texts: Iterable<Text>): void {
+  for (const text of texts) {
+    for (let at = text.data.lastIndexOf(TYPING_STYLE_SENTINEL); at >= 0;
+      at = at > 0 ? text.data.lastIndexOf(TYPING_STYLE_SENTINEL, at - 1) : -1) {
+      text.deleteData(at, TYPING_STYLE_SENTINEL.length);
+    }
+  }
+}
+
+function textNodesIn(root: Node): Text[] {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const texts: Text[] = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) texts.push(node as Text);
+  return texts;
+}
+
+/**
+ * The size auto-fit had given the box text was last copied or cut from, with
+ * that text. Chromium serializes the copied runs with the editable root's
+ * inline `font-size` -- the fitted size of that moment -- so pasting them back
+ * after the box refitted, or into another box, froze them at it. A paste of
+ * the same text strips that size again (`stripFittedFontSize`).
+ */
+let copiedFit: { text: string; size: string } | null = null;
+
+const collapsedText = (value: string): string => value.replace(/[\s\u00a0\u200b\u2060]+/g, ' ').trim();
+
+/**
+ * Turn every pending typing run that already holds typed text into the
+ * plain styled span it will be saved as. Chromium's own cut and copy
+ * serialize the live DOM, so a run still pending when the author copies
+ * would otherwise put its invisible sentinel on the clipboard -- and a paste
+ * lands it outside any marker, as a real character in the text.
+ */
+function settleTypedMarkers(body: HTMLElement): void {
+  for (const marker of [...body.querySelectorAll<HTMLElement>('[data-editor-typing-style]')]) {
+    if ((marker.textContent ?? '').replaceAll(TYPING_STYLE_SENTINEL, '') === '') continue;
+    deleteSentinels(textNodesIn(marker));
+    marker.removeAttribute('data-editor-typing-style');
+  }
+}
+
+/** A sentinel outside a pending run is a leak (an older clipboard, say). */
+function deleteStraySentinels(body: HTMLElement): void {
+  deleteSentinels(textNodesIn(body).filter((text) => (
+    text.data.includes(TYPING_STYLE_SENTINEL)
+    && !text.parentElement?.closest('[data-editor-typing-style]')
+  )));
+}
+
 /** Serialize authored text without editor-only table selection chrome. */
 function authoredTextHtml(body: HTMLElement): string {
   const clone = body.cloneNode(true) as HTMLElement;
@@ -426,7 +500,22 @@ function authoredTextHtml(body: HTMLElement): string {
   // differently across commits, and every spurious byte of difference becomes
   // a phantom "Edit text" undo entry.
   clone.querySelectorAll('[class=""]').forEach((node) => node.removeAttribute('class'));
+  // Media bytes never live in text html, whatever put them in the DOM: a
+  // drop, an execCommand, a paste path that missed them. A pasted 10 MB data:
+  // video once made a slide title's html 13.5 MB of deck.json.
+  stripTextMediaPayloads(clone);
   return normalizeParagraphHtml(clone.innerHTML);
+}
+
+/**
+ * The authored html a store html becomes once loaded into an editing
+ * surface — what `authoredTextHtml` would read back from a box just opened
+ * on it. Built in an inert document, so no image in it starts loading.
+ */
+function editingFormOf(html: string): string {
+  const scratch = document.implementation.createHTMLDocument('').createElement('div');
+  scratch.innerHTML = normalizeParagraphHtml(restoreKatexSourceHtml(html), true);
+  return authoredTextHtml(scratch);
 }
 
 /**
@@ -466,6 +555,80 @@ function relativeRunFontSize(text: Text, root: HTMLElement): string | null {
     if (declared) return isRelativeFontSize(declared) ? declared : null;
   }
   return null;
+}
+
+/**
+ * The paragraphs and list items of a text box that hold lines of their own:
+ * blocks with no block inside them. These are what paragraph and line spacing
+ * apply to, and what a font size can be written on.
+ */
+function leafTextBlocks(root: HTMLElement): HTMLElement[] {
+  return [...root.querySelectorAll<HTMLElement>('p, li, div')]
+    .filter((block) => !block.querySelector('p, li, div'));
+}
+
+/**
+ * Move a size the selection gave every character of a block onto the block.
+ *
+ * A line is as tall as the larger of its block's own font size (the "strut")
+ * and the runs on it, each times the line height. Sizing only the runs of a
+ * paragraph left its strut at the old size, so a paragraph shrunk from 28px
+ * to 14px kept 28px lines: small text on wide lines. Where every character of
+ * a block is selected, the block takes the size and its runs drop theirs, so
+ * the lines follow. A block only partly selected keeps its own size: one small
+ * word does not tighten the line it sits on, as in any typesetting program.
+ *
+ * Empty lines strictly inside the selection (`<p><br></p>` between two sized
+ * paragraphs) take the size too, or they would stay tall between them.
+ * Proportional runs (`0.7em` superscripts) keep their declaration and now
+ * scale with the block, which is the size they sit next to.
+ */
+function sizeWholeBlocks(root: HTMLElement, selected: Set<Text>, size: string): void {
+  if (selected.size === 0) return;
+  const ordered = [...selected].sort((a, b) =>
+    (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+  const first = ordered[0];
+  const last = ordered[ordered.length - 1];
+  const inside = (node: Node): boolean =>
+    Boolean(first.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)
+    && Boolean(node.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_FOLLOWING);
+  for (const block of leafTextBlocks(root)) {
+    const texts: Text[] = [];
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+    for (let current = walker.nextNode(); current; current = walker.nextNode()) {
+      const text = current as Text;
+      if (text.data.replace(/[\s\u200b\u2060]+/g, '')) texts.push(text);
+    }
+    const whole = texts.length > 0
+      ? texts.every((text) => selected.has(text))
+      : inside(block);
+    if (!whole) continue;
+    block.style.fontSize = size;
+    for (const node of block.querySelectorAll<HTMLElement>('[style]')) {
+      // The pending typing run belongs to the caret, not to this selection.
+      if (node.closest('[data-editor-typing-style]')) continue;
+      if (!node.style.fontSize || isRelativeFontSize(node.style.fontSize)) continue;
+      node.style.removeProperty('font-size');
+      if (!node.getAttribute('style')?.trim()) node.removeAttribute('style');
+    }
+  }
+}
+
+/**
+ * The line spacing a text renders with, as a ratio of its font size: read on
+ * the block holding `target`, since a line's height is its block's. Chromium
+ * reports a unitless line height resolved to px; either form reads back as
+ * the ratio. Null for `normal`, which is the font's own and has no number.
+ */
+function lineSpacingOf(target: HTMLElement, root: HTMLElement): number | null {
+  const block = target.closest<HTMLElement>('p, li, div, td, th');
+  const style = getComputedStyle(block && root.contains(block) ? block : root);
+  const declared = style.lineHeight.trim();
+  if (/^\d*\.?\d+$/.test(declared)) return Number(declared);
+  const lineHeight = Number.parseFloat(declared);
+  const fontSize = Number.parseFloat(style.fontSize);
+  if (!declared.endsWith('px') || !(lineHeight > 0) || !(fontSize > 0)) return null;
+  return Math.round((lineHeight / fontSize) * 100) / 100;
 }
 
 /** True for the anonymous inline wrappers created by character formatting. */
@@ -543,11 +706,63 @@ function normalizeInlineStyleSpans(root: HTMLElement): void {
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 8;
 const ZOOM_STEP = 0.25;
+/** Zoom ratio of one mouse-wheel notch with Ctrl/Cmd held, in either direction. */
+const WHEEL_NOTCH_ZOOM = 1.1;
+/**
+ * A pixel-mode wheel event at least this large is a mouse notch: Chromium
+ * reports 100 px a notch on Windows and 120 on Linux (less on a scaled
+ * display), and sums notches that arrive within one frame. A trackpad pinch
+ * frame is -100·ln(scale): a few fractional pixels.
+ */
+const WHEEL_NOTCH_MIN_PX = 50;
+const WHEEL_NOTCH_PX = 100;
+/** Firefox reports a notch in lines; three is every platform's default. */
+const WHEEL_LINES_PER_NOTCH = 3;
+
+/**
+ * The zoom ratio a Ctrl/Cmd wheel event asks for. A mouse notch is a fixed
+ * ×1.1 (notches in one event compound); a trackpad pinch keeps its smooth
+ * exponential curve, capped at one notch per event, so the 40 px that
+ * Chromium on macOS reports for a mouse tick cannot leap either. Both are
+ * symmetric: the same delta the other way is the exact inverse.
+ */
+export function wheelZoomFactor(deltaY: number, deltaMode: number): number {
+  if (deltaY === 0) return 1;
+  const direction = deltaY < 0 ? 1 : -1;
+  const size = Math.abs(deltaY);
+  let notches: number;
+  if (deltaMode === WheelEvent.DOM_DELTA_LINE) {
+    notches = Math.max(1, Math.round(size / WHEEL_LINES_PER_NOTCH));
+  } else if (deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+    notches = Math.max(1, Math.round(size));
+  } else if (size >= WHEEL_NOTCH_MIN_PX) {
+    notches = Math.max(1, Math.round(size / WHEEL_NOTCH_PX));
+  } else {
+    return Math.exp(direction * Math.min(size * 0.01, Math.log(WHEEL_NOTCH_ZOOM)));
+  }
+  return WHEEL_NOTCH_ZOOM ** (direction * notches);
+}
+
+/**
+ * The canvas zoom a key chord asks for: Cmd/Ctrl with = or + zooms in, with
+ * - or _ zooms out, with 0 fits. Matched by character, so a layout with its
+ * own + key works unshifted, as it does for the browser's page zoom.
+ */
+export function zoomShortcut(e: KeyboardEvent): 'in' | 'out' | 'fit' | null {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return null;
+  if (e.key === '=' || e.key === '+') return 'in';
+  if (e.key === '-' || e.key === '_') return 'out';
+  if (e.key === '0' && !e.shiftKey) return 'fit';
+  return null;
+}
 const HANDLE_NAMES = Object.keys(HANDLES);
 type MoveOrigin = Rect & { control?: { x: number; y: number } };
 type ResizeOrigin = Rect & {
   rot: number;
   sourceBox?: Rect | null;
+  /** Media's `fit` when the drag began: it decides whether the drag keeps
+   * proportions, and is put back if Shift is let go mid-drag. */
+  fit?: 'cover' | 'contain' | 'fill';
   control?: { x: number; y: number } | null;
 };
 
@@ -561,7 +776,6 @@ type DragMode =
       origin: Rect;
       origins: Map<string, ResizeOrigin>;
       elementId: string;
-      aspect: number;
     }
   | {
       kind: 'table-column-resize';
@@ -593,7 +807,9 @@ type DragMode =
       /** Original endpoints of every selected line, keyed by id. */
       origins: Map<string, { start: XY; end: XY }>;
     }
-  | { kind: 'curve-control'; elementId: string };
+  | { kind: 'curve-control'; elementId: string }
+  | { kind: 'brace-tip'; elementId: string }
+  | { kind: 'polygon-corner'; elementId: string; index: number };
 
 /** Fired on the canvas host with a message (`detail`) for the shell's status bar. */
 export const CANVAS_NOTICE_EVENT = 'deckwerk-canvas-notice';
@@ -606,6 +822,8 @@ export class EditorCanvas {
   private overlay: HTMLElement;
   private zoomInput: HTMLInputElement;
   private tableHeightSyncPending = false;
+  /** Content-size passes run since the last frame; see scheduleTableHeightSync. */
+  private tableHeightSyncPassesThisFrame = 0;
 
   /** Final canvas-pixel to screen-pixel scale (fit scale × user zoom). */
   private scale = 1;
@@ -613,6 +831,10 @@ export class EditorCanvas {
   private zoom = 1;
   /** Screen-pixel displacement from the centred stage position. */
   private pan = { x: 0, y: 0 };
+  /** A hand-pan in progress: a middle-button drag, or a drag with Space held. */
+  private viewportPan: { pointerId: number; x: number; y: number } | null = null;
+  /** Space is held over the canvas, so the primary button pans; see bindSpacePan. */
+  private spacePan = false;
   /** Height of chrome covering the bottom of the host; see setBottomInset. */
   private bottomInset = 0;
   private drag: DragMode = { kind: 'none' };
@@ -706,6 +928,8 @@ export class EditorCanvas {
    */
   private textEditStoreBase: string | null = null;
   private textEditDomBase: string | null = null;
+  /** An IME composition is open in the box being edited (see adoptRemoteEditedHtml). */
+  private textEditComposing = false;
   /** Re-enter this edit after a rebuild that was forced mid-session. */
   private pendingEditReentry: {
     elementId: string;
@@ -719,6 +943,8 @@ export class EditorCanvas {
   private textEditRevertHtml: string | null = null;
   /** Ends the current run of typing so the next edit is its own undo step. */
   private sealTextChunk: (() => void) | null = null;
+  /** Spelling and grammar checking of the box being edited (no DOM of its own). */
+  readonly spelling = new SpellingSession();
   /**
    * What the text panel last drew itself from, so a moving caret redraws it
    * only when the answer changes. The panel reports the run under the
@@ -733,7 +959,32 @@ export class EditorCanvas {
     end: Element | null;
   } | null = null;
   /** Last non-collapsed browser selection inside the active text element. */
-  private textSelectionRange: Range | null = null;
+  private textSelectionBookmark: Range | null = null;
+  private get textSelectionRange(): Range | null {
+    return this.textSelectionBookmark;
+  }
+  /** Every move of the bookmark re-derives whether the sidebar shows it. */
+  private set textSelectionRange(range: Range | null) {
+    this.textSelectionBookmark = range;
+    this.keptSelection.schedule();
+  }
+  /**
+   * Paints the bookmark while focus is in the sidebar, where the browser's
+   * own highlight cannot reach it (keptSelection.ts).
+   */
+  private readonly keptSelection = new KeptSelectionHighlight(() => {
+    const selection = window.getSelection();
+    return {
+      content: this.editingId
+        ? this.slideLayer.querySelector<HTMLElement>(
+          `[data-element-id="${CSS.escape(this.editingId)}"] .text-content`,
+        )
+        : null,
+      bookmark: this.textSelectionBookmark,
+      live: selection?.rangeCount ? selection.getRangeAt(0) : null,
+      active: document.activeElement,
+    };
+  });
   /** Rectangular cell range currently targeted in the live table editor. */
   private tableSelection: TableSelection | null = null;
   /** Shared paint used by table border presets and the explicit edge tool. */
@@ -761,6 +1012,17 @@ export class EditorCanvas {
     /** The click was the second of a double-click: take the word under it. */
     selectWord: boolean;
   } | null = null;
+  /**
+   * A video, web or image element whose second click of a double-click went
+   * down on it; the pointer-up toggles it (playback, the live page, or crop
+   * mode) unless the press became a drag. Safari does
+   * not reliably dispatch `dblclick` on the canvas (the first click's selection
+   * redraw and the host's pointer capture leave it no common target), so the
+   * native event alone left double-click-to-play inert there.
+   */
+  private pendingMediaToggle: string | null = null;
+  /** When the pointer path last toggled media, so the native dblclick skips. */
+  private mediaToggledAt = Number.NEGATIVE_INFINITY;
 
   /**
    * Id of the element whose crop is being edited, if any.
@@ -832,9 +1094,20 @@ export class EditorCanvas {
     });
     this.bindViewportGestures();
     this.bindDrop();
-    document.addEventListener('selectionchange', () => this.captureTextSelection());
+    document.addEventListener('selectionchange', () => {
+      this.captureTextSelection();
+      this.keptSelection.schedule();
+    });
+    // Focus moving between the text and the sidebar decides whether the
+    // bookmarked selection needs painting by hand.
+    document.addEventListener('focusin', () => this.keptSelection.schedule());
+    document.addEventListener('focusout', () => this.keptSelection.schedule());
 
     store.subscribe(() => this.render());
+    onCommentHighlightsChange(() => {
+      const slide = this.store.slide;
+      if (slide) this.drawOverlay(this.store.get().deck, slide.elements, this.store.get().selection);
+    });
     this.render();
   }
 
@@ -852,6 +1125,9 @@ export class EditorCanvas {
    * test for "did the content change".
    */
   render(): void {
+    // A render can replace the edited box's nodes out from under the
+    // bookmark, or end the edit: either way the kept highlight is re-derived.
+    this.keptSelection.schedule();
     const { deck, slideIndex, selection } = this.store.get();
     const slide = deck.slides[slideIndex];
     if (!slide) {
@@ -870,7 +1146,7 @@ export class EditorCanvas {
     // them.
     if (
       slide === this.renderedSlide
-      || (this.renderedSlide !== null && sameSlideIgnoringNotes(this.renderedSlide, slide))
+      || (this.renderedSlide !== null && sameSlideDrawing(this.renderedSlide, slide))
     ) {
       this.renderedSlide = slide;
       this.rescale();
@@ -899,6 +1175,9 @@ export class EditorCanvas {
       // A live cell range's highlight lives on cell nodes a patch can
       // replace; repaint it (or drop a range whose cells are now gone).
       this.syncTableSelectionHighlight();
+      // Outside a text edit no spelling highlight may survive: its ranges
+      // would point into nodes the session no longer owns.
+      if (!this.editingId) this.spelling.assertDetached();
       // In development, verify that patching left the DOM where a full render
       // would have. A property handled by `renderElement` and not by the patch
       // path updates the deck without changing the pixels, and the only symptom
@@ -1120,33 +1399,91 @@ export class EditorCanvas {
     }
   }
 
-  /** Keep native table frames tight around their laid-out rows. */
+  /**
+   * Keep content-sized frames tight around what they hold: native tables
+   * around their laid-out rows, and text boxes sized to their text around
+   * their text.
+   *
+   * The pass runs as a microtask: after the render that queued it, but
+   * before the browser paints. A frame later was too late — every render
+   * from a deck holding a stale size (a toggle, a collaborator's echo, a
+   * reload) painted that size for one frame before the fit corrected it,
+   * which is the flicker. Passes that keep queueing passes are capped per
+   * frame, so a measurement that never settled would cost a frame per step
+   * rather than hang the page.
+   */
   private scheduleTableHeightSync(): void {
     if (this.tableHeightSyncPending) return;
     this.tableHeightSyncPending = true;
-    requestAnimationFrame(() => {
+    const run = () => {
       this.tableHeightSyncPending = false;
-      if (this.editingId) return;
-      const slide = this.store.slide;
-      if (!slide) return;
-      const heights = new Map<string, number>();
-      for (const element of slide.elements) {
-        if (element.type !== 'text' || !element.table?.autoHeight || element.autoFit) continue;
+      this.syncContentSizes();
+    };
+    if (this.tableHeightSyncPassesThisFrame >= 8) {
+      requestAnimationFrame(run);
+      return;
+    }
+    if (this.tableHeightSyncPassesThisFrame++ === 0) {
+      requestAnimationFrame(() => { this.tableHeightSyncPassesThisFrame = 0; });
+    }
+    queueMicrotask(run);
+  }
+
+  private syncContentSizes(): void {
+    const slide = this.store.slide;
+    if (!slide) return;
+    const heights = new Map<string, number>();
+    const boxes = new Map<string, { x: number; w: number; h: number }>();
+    for (const element of slide.elements) {
+      if (element.type === 'text' && element.autoSize && !element.table) {
+        const node = this.slideLayer.querySelector<HTMLElement>(
+          `[data-element-id="${CSS.escape(element.id)}"]`,
+        );
+        if (!node) continue;
+        // The box being typed into owns its size: it travels with the text
+        // commits. A render may still have put the stored size back on the
+        // node (a commit that has not caught up with the last keystrokes),
+        // so the live size goes back on with it. Every other box fits as usual.
+        if (element.id === this.editingId) {
+          this.followTextSizeWhileEditing(node, element.id);
+          continue;
+        }
+        const box = measureTextToSize(node, element);
+        if (box) boxes.set(element.id, box);
+        continue;
+      }
+      if (this.editingId) continue;
+      if (element.type !== 'text' || !element.table?.autoHeight || element.autoFit) continue;
         const table = this.slideLayer.querySelector<HTMLTableElement>(
           `[data-element-id="${CSS.escape(element.id)}"] .text-content > table`,
         );
-        const height = Math.ceil(table?.offsetHeight ?? 0);
-        if (height >= 8 && Math.abs(height - element.h) > 1) heights.set(element.id, height);
+      const height = Math.ceil(table?.offsetHeight ?? 0);
+      if (height >= 8 && Math.abs(height - element.h) > 1) heights.set(element.id, height);
+    }
+    if (heights.size === 0 && boxes.size === 0) return;
+    this.store.commit((deck) => {
+      const current = deck.slides[this.store.get().slideIndex];
+      for (const element of current?.elements ?? []) {
+        const height = heights.get(element.id);
+        if (height !== undefined) element.h = height;
+        const box = boxes.get(element.id);
+        if (box) Object.assign(element, box);
       }
-      if (heights.size === 0) return;
-      this.store.commit((deck) => {
-        const current = deck.slides[this.store.get().slideIndex];
-        for (const element of current?.elements ?? []) {
-          const height = heights.get(element.id);
-          if (height !== undefined) element.h = height;
-        }
-      }, { label: 'Fit table rows', measurement: true });
-    });
+    }, { label: 'Fit text box', measurement: true });
+  }
+
+  /**
+   * The size a text box sized to its text takes with what its node now
+   * holds, written onto `target` — the copy a text commit is changing — so
+   * the box's new size is part of the same edit as the words that made it.
+   */
+  private fitEditedText(target: SlideElement): void {
+    if (target.type !== 'text' || !target.autoSize || target.table) return;
+    const node = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(target.id)}"]`,
+    );
+    const box = node ? measureTextToSize(node, target) : null;
+    if (box) Object.assign(target, box);
   }
 
   /** Re-measure one table during its active resize transaction. */
@@ -1240,7 +1577,7 @@ export class EditorCanvas {
     for (const el of slide.elements) {
       if (el.type !== 'text' && el.type !== 'html') continue;
       if (el.id === this.editingId) {
-        this.adoptRemoteEditedHtml(el);
+        this.adoptRemoteEditedHtml(el, this.store.isApplyingRemote());
         continue;
       }
       const prev = before.get(el.id);
@@ -1255,35 +1592,79 @@ export class EditorCanvas {
 
   /**
    * Bring a collaborator's change to the box being edited into the live
-   * contenteditable — when nothing here would be lost. Skipping the edited
-   * element entirely meant the session held a stale copy that its next
-   * whole-box commit re-asserted, silently reverting the peer's edit (a list
-   * conversion, a deleted table row) the moment the local author formatted or
-   * left the box. Adoption happens only while the local DOM matches the last
-   * sync point; unsent local changes still win (whole-box last-writer-wins).
+   * contenteditable. Skipping the edited element entirely meant the session
+   * held a stale copy that its next whole-box commit re-asserted, silently
+   * reverting the peer's edit (a list conversion, a deleted table row) the
+   * moment the local author formatted or left the box.
+   *
+   * With nothing unsent here, the box takes the remote html as it is. With
+   * unsent keystrokes (both people typing at once), the remote change is
+   * merged three ways with them against the last sync point (textMerge.ts):
+   * keeping the local DOM whole was last-writer-wins, and the next push wiped
+   * the other person's words. Either way the caret is carried through the
+   * change by what was inserted or removed before it, not left at the same
+   * numeric offset, which dropped the next keystrokes into the middle of the
+   * other person's word.
    */
-  private adoptRemoteEditedHtml(el: SlideElement & { type: 'text' | 'html' }): void {
+  private adoptRemoteEditedHtml(
+    el: SlideElement & { type: 'text' | 'html' },
+    fromElsewhere: boolean,
+  ): void {
     if (this.textEditStoreBase === null || el.html === this.textEditStoreBase) return;
     const body = this.slideLayer.querySelector<HTMLElement>(
       `[data-element-id="${CSS.escape(el.id)}"] .text-content`,
     );
     if (!body) return;
-    if (this.textEditDomBase === null || authoredTextHtml(body) !== this.textEditDomBase) {
-      // Unsent local work: keep the local DOM authoritative, but move the
-      // store base forward so this remote state is not treated as "ours" by
-      // later comparisons.
+    // An open IME composition owns the preedit text in the DOM; rewriting the
+    // box would cancel it. Leave the sync point where it is: the first push
+    // after the composition commits takes this change in (pushLive).
+    if (this.textEditComposing) return;
+    const domBase = this.textEditDomBase;
+    if (domBase === null) {
       this.textEditStoreBase = el.html;
       return;
     }
-    const range = this.activeTextRange(body);
-    const offsets = range ? this.textOffsetsForRange(body, range) : null;
-    // A peer can send legacy generated KaTeX just as the session can start
-    // with it; keep the live editing surface in authored delimiter form.
-    body.innerHTML = normalizeParagraphHtml(restoreKatexSourceHtml(el.html), true);
-    if (offsets) this.restoreTextRange(body, offsets);
+    const local = authoredTextHtml(body);
+    if (local !== domBase && !fromElsewhere) {
+      // This session's own commit coming back through the store (the render
+      // it triggers runs before the commit records its sync point), or
+      // another local control's change: the DOM stays authoritative.
+      this.textEditStoreBase = el.html;
+      return;
+    }
+    const remote = local === domBase ? null : editingFormOf(el.html);
+    const merged = remote === null ? null : mergeTextHtml(domBase, remote, local);
+    if (merged !== local) {
+      const range = this.activeTextRange(body);
+      const offsets = range ? this.textOffsetsForRange(body, range) : null;
+      // Flat text offsets cannot tell the end of one paragraph from the start
+      // of the next; a caret that sat at the end of its text stays there.
+      const affinity = range?.collapsed && range.startContainer instanceof Text
+        && range.startOffset > 0 && range.startOffset === range.startContainer.data.length
+        ? 'backward' : 'forward';
+      const before = body.textContent ?? '';
+      // A peer can send legacy generated KaTeX just as the session can start
+      // with it; keep the live editing surface in authored delimiter form.
+      body.innerHTML = merged === null
+        ? normalizeParagraphHtml(restoreKatexSourceHtml(el.html), true)
+        : normalizeParagraphHtml(merged, true);
+      if (offsets) {
+        const after = body.textContent ?? '';
+        this.restoreTextRange(body, {
+          start: mapTextOffset(before, after, offsets.start),
+          end: mapTextOffset(before, after, offsets.end),
+        }, affinity);
+      }
+    }
     this.textEditStoreBase = el.html;
-    this.textEditDomBase = authoredTextHtml(body);
-    this.textEditRevertHtml = el.html;
+    if (remote === null) {
+      this.textEditDomBase = authoredTextHtml(body);
+      this.textEditRevertHtml = el.html;
+    } else {
+      // The sync point is now the remote state; what the merge kept of the
+      // local keystrokes is still unsent, and the next push carries it.
+      this.textEditDomBase = remote;
+    }
   }
 
   /** Reposition and restyle existing nodes for a non-structural change. */
@@ -1306,7 +1687,7 @@ export class EditorCanvas {
       // and forgotten by the other. Everything below is genuinely editor-side:
       // details that live on child nodes a rebuild would have recreated.
       const before = previous?.elements.find((e) => e.id === el.id);
-      applyElementBoxStyles(node, el, before);
+      applyElementBoxStyles(node, el, before, resolve.resolveSrc);
       applyTextRenderState(node, el, before);
       if (el.type === 'image' || el.type === 'video') {
         syncMediaFrame(node, el);
@@ -1496,12 +1877,36 @@ export class EditorCanvas {
     });
 
     controls.append(
-      button('−', 'Zoom out', () => this.setZoom(this.zoom - ZOOM_STEP)),
+      button('−', 'Zoom out', () => this.stepZoom(-1)),
       input,
-      button('+', 'Zoom in', () => this.setZoom(this.zoom + ZOOM_STEP)),
+      button('+', 'Zoom in', () => this.stepZoom(1)),
       button('⌖', 'Re-center slide', () => this.recenter()),
     );
     return controls;
+  }
+
+  /**
+   * One step of the zoom bar (and of Cmd/Ctrl +/-): to the next multiple of
+   * 25% that way, so a view the wheel left at 110% steps to 125%, not 135%.
+   */
+  private stepZoom(direction: 1 | -1): void {
+    const steps = this.zoom / ZOOM_STEP;
+    const next = direction > 0 ? Math.floor(steps + 1e-6) + 1 : Math.ceil(steps - 1e-6) - 1;
+    this.setZoom(next * ZOOM_STEP);
+  }
+
+  /**
+   * Answer a Cmd/Ctrl zoom chord (see `zoomShortcut`) in place of the
+   * browser's page zoom and the desktop menu's zoom roles, which would scale
+   * the whole interface. Returns whether the key was taken.
+   */
+  handleZoomShortcut(e: KeyboardEvent): boolean {
+    const action = zoomShortcut(e);
+    if (!action) return false;
+    e.preventDefault();
+    if (action === 'fit') this.recenter();
+    else this.stepZoom(action === 'in' ? 1 : -1);
+    return true;
   }
 
   private commitZoomInput(input: HTMLInputElement): void {
@@ -1558,16 +1963,13 @@ export class EditorCanvas {
       if ((event.target as HTMLElement).closest('.zoom-controls, .notes-drawer')) return;
 
       // Chromium represents a macOS trackpad pinch as a wheel event with the
-      // control modifier set. Anchoring it at the pointer makes the gesture
-      // feel native and keeps the detail the user is inspecting under hand.
+      // control modifier set, and a mouse wheel with Ctrl/Cmd held arrives
+      // the same way. Anchoring it at the pointer makes the gesture feel
+      // native and keeps the detail the user is inspecting under hand.
       if (event.ctrlKey || event.metaKey) {
         event.preventDefault();
-        const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16
-          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.host.clientHeight
-            : 1;
-        const factor = Math.exp(-event.deltaY * unit * 0.01);
         const hostRect = this.viewportRect();
-        this.setZoom(this.zoom * factor, {
+        this.setZoom(this.zoom * wheelZoomFactor(event.deltaY, event.deltaMode), {
           x: event.clientX - hostRect.left,
           y: event.clientY - hostRect.top,
         });
@@ -1580,10 +1982,98 @@ export class EditorCanvas {
       const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16
         : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.host.clientHeight
           : 1;
-      this.pan.x -= event.deltaX * unit;
-      this.pan.y -= event.deltaY * unit;
+      // Shift turns a mouse wheel sideways. macOS does that itself (deltaX
+      // arrives filled in); elsewhere the vertical delta is taken as it is.
+      const sideways = event.shiftKey && event.deltaX === 0;
+      this.pan.x -= (sideways ? event.deltaY : event.deltaX) * unit;
+      this.pan.y -= (sideways ? 0 : event.deltaY) * unit;
       this.rescale();
     }, { passive: false });
+
+    // A middle click on Linux pastes the primary selection into whatever has
+    // focus (the text being edited), and on Windows starts autoscroll. On the
+    // canvas the middle button only ever pans.
+    for (const type of ['mousedown', 'mouseup', 'auxclick'] as const) {
+      this.host.addEventListener(type, (event) => {
+        if (event.button === 1) event.preventDefault();
+      });
+    }
+    this.bindSpacePan();
+  }
+
+  /**
+   * Holding Space over the canvas turns the primary button into a hand, as in
+   * Figma and Photoshop: the way to pan with a mouse that has no free wheel
+   * axis. Only while nothing that takes typed text has focus, and nothing on
+   * the canvas answers Space by itself, so a press without a drag does
+   * nothing.
+   */
+  private bindSpacePan(): void {
+    const isSpace = (ev: KeyboardEvent) => ev.code === 'Space' || ev.key === ' ';
+    const release = () => {
+      this.spacePan = false;
+      this.host.classList.remove('space-pan');
+    };
+    window.addEventListener('keydown', (ev) => {
+      if (!isSpace(ev)) return;
+      if (this.spacePan) {
+        ev.preventDefault(); // auto-repeat while held
+        return;
+      }
+      if (ev.metaKey || ev.ctrlKey || ev.altKey || this.editingId) return;
+      if (document.querySelector('[aria-modal="true"]')) return;
+      // The canvas, or nothing in particular (a canvas click blurs whatever
+      // had focus). A focused button or field keeps its own Space.
+      const target = ev.target instanceof Element ? ev.target : null;
+      const onCanvas = !target || target === document.body
+        || target === document.documentElement || this.host.contains(target);
+      const takesSpace = target?.closest(
+        'input, textarea, select, button, [contenteditable]:not([contenteditable="false"]), .cm-editor',
+      );
+      if (!onCanvas || takesSpace) return;
+      ev.preventDefault();
+      this.spacePan = true;
+      this.host.classList.add('space-pan');
+    });
+    window.addEventListener('keyup', (ev) => {
+      if (isSpace(ev)) release();
+    });
+    window.addEventListener('blur', release);
+  }
+
+  /** Start a hand-pan for a middle-button press, or a primary press with Space held. */
+  private beginViewportPan(ev: PointerEvent): boolean {
+    if (ev.button !== 1 && !(ev.button === 0 && this.spacePan)) return false;
+    const target = ev.target instanceof Element ? ev.target : null;
+    if (target?.closest('.welcome-screen, .zoom-controls, .notes-toggle, .notes-drawer')) return false;
+    // No selection, no text selection, no focus change: a text box being
+    // edited stays in its edit.
+    ev.preventDefault();
+    this.viewportPan = { pointerId: ev.pointerId, x: ev.clientX, y: ev.clientY };
+    this.host.setPointerCapture(ev.pointerId);
+    this.host.classList.add('is-panning');
+    return true;
+  }
+
+  private moveViewportPan(ev: PointerEvent): boolean {
+    const pan = this.viewportPan;
+    if (!pan || pan.pointerId !== ev.pointerId) return false;
+    this.pan.x += ev.clientX - pan.x;
+    this.pan.y += ev.clientY - pan.y;
+    pan.x = ev.clientX;
+    pan.y = ev.clientY;
+    this.rescale();
+    return true;
+  }
+
+  private endViewportPan(ev: PointerEvent): boolean {
+    const pan = this.viewportPan;
+    if (!pan || pan.pointerId !== ev.pointerId) return false;
+    ev.preventDefault();
+    this.viewportPan = null;
+    this.host.classList.remove('is-panning');
+    if (this.host.hasPointerCapture?.(ev.pointerId)) this.host.releasePointerCapture(ev.pointerId);
+    return true;
   }
 
   /**
@@ -1672,28 +2162,40 @@ export class EditorCanvas {
       }
     }
 
-    // Comment badges: a small bubble pinned to the top-right corner of any
-    // element that carries comments. Always visible (comments are useless if
-    // you cannot find them), counter-scaled like the handles, clickable even
-    // though the overlay itself is pointer-events: none.
-    for (const el of elements) {
-      const open = openCount(el.comments);
-      if ((el.comments?.length ?? 0) === 0) continue;
-      const bubble = document.createElement('div');
-      bubble.className = `element-comment${open > 0 ? '' : ' resolved'}`;
-      bubble.textContent = open > 0 ? String(open) : '✓';
-      bubble.title = open > 0
-        ? `${open} open comment${open === 1 ? '' : 's'}`
-        : 'All comments resolved';
-      bubble.style.left = `${el.x + el.w}px`;
-      bubble.style.top = `${el.y}px`;
-      bubble.style.setProperty('--inv', String(1 / this.scale));
-      bubble.addEventListener('pointerdown', (e) => e.stopPropagation());
-      bubble.addEventListener('click', (e) => {
-        e.stopPropagation();
-        this.openElementComments(el.id, bubble.getBoundingClientRect());
-      });
-      frag.appendChild(bubble);
+    // Comment highlights: whatever carries an open thread, and whatever the
+    // open comment popover is about (drawn stronger). Under the selection
+    // outlines, and inert: threads open from the right-click menu only.
+    {
+      const slide = this.store.slide;
+      const focus = commentFocus();
+      const shown = commentHighlightsShown();
+      const onThisSlide = focus !== null && focus.slideId === slide?.id;
+      const slideOpen = shown && slide ? openThreadCount(slide.comments) : 0;
+      if (slide && (slideOpen > 0 || (onThisSlide && !focus.elementId))) {
+        const frame = document.createElement('div');
+        frame.className = `comment-mark comment-slide-mark${onThisSlide && !focus.elementId ? ' hot' : ''}`;
+        frame.style.width = `${deck.canvas.w}px`;
+        frame.style.height = `${deck.canvas.h}px`;
+        frame.style.setProperty('--inv', String(1 / this.scale));
+        if (slideOpen > 0) frame.dataset.count = String(slideOpen);
+        frag.appendChild(frame);
+      }
+      for (const el of elements) {
+        const open = shown ? openThreadCount(el.comments) : 0;
+        const hot = onThisSlide && focus.elementId === el.id;
+        if (open === 0 && !hot) continue;
+        const mark = document.createElement('div');
+        mark.className = `comment-mark${hot ? ' hot' : ''}`;
+        mark.dataset.elementId = el.id;
+        mark.style.left = `${el.x}px`;
+        mark.style.top = `${el.y}px`;
+        mark.style.width = `${el.w}px`;
+        mark.style.height = `${el.h}px`;
+        if (el.rot && !hasEndpoints(el)) mark.style.transform = `rotate(${el.rot}deg)`;
+        mark.style.setProperty('--inv', String(1 / this.scale));
+        if (open > 0) mark.dataset.count = String(open);
+        frag.appendChild(mark);
+      }
     }
 
     // In mask mode, show the full frame faintly outside the crop window so it
@@ -1721,7 +2223,7 @@ export class EditorCanvas {
       box.style.top = `${el.y}px`;
       box.style.width = `${el.w}px`;
       box.style.height = `${el.h}px`;
-      const isLine = el.type === 'shape' && (el.shape === 'line' || el.shape === 'arrow');
+      const isLine = hasEndpoints(el);
       // The outline must sit on the element as drawn, not where the frame
       // would be at rot 0. Same rotation, same centre as the element node.
       // Line/arrow selections stay unrotated: their children (endpoints,
@@ -1731,10 +2233,10 @@ export class EditorCanvas {
       // Counter-scale so outlines and handles stay one visual size at any zoom.
       box.style.setProperty('--inv', String(1 / this.scale));
 
-      // Lines and arrows get endpoint handles instead of a resize box: what
-      // you want to move is where the arrow starts and ends, not its bounding
-      // rectangle.
-      if (el.type === 'shape' && (el.shape === 'line' || el.shape === 'arrow')) {
+      // Lines, arrows and braces get endpoint handles instead of a resize
+      // box: what you want to move is where the arrow starts and ends, not
+      // its bounding rectangle.
+      if (el.type === 'shape' && hasEndpoints(el)) {
         box.classList.add('line-sel');
         const pts = lineEndpoints(el);
         if (selection.size > 1) {
@@ -1748,9 +2250,11 @@ export class EditorCanvas {
           const path = document.createElementNS(ns, 'path');
           const start = { x: pts.start.x - el.x, y: pts.start.y - el.y };
           const end = { x: pts.end.x - el.x, y: pts.end.y - el.y };
-          path.setAttribute('d', el.control
-            ? `M ${start.x} ${start.y} Q ${el.control.x - el.x} ${el.control.y - el.y} ${end.x} ${end.y}`
-            : `M ${start.x} ${start.y} L ${end.x} ${end.y}`);
+          path.setAttribute('d', el.shape === 'brace'
+            ? `M ${bracePolyline(el).map((p) => `${p.x - el.x} ${p.y - el.y}`).join(' L ')}`
+            : el.control
+              ? `M ${start.x} ${start.y} Q ${el.control.x - el.x} ${el.control.y - el.y} ${end.x} ${end.y}`
+              : `M ${start.x} ${start.y} L ${end.x} ${end.y}`);
           path.setAttribute('fill', 'none');
           path.setAttribute('stroke-width', String(3 / this.scale));
           svg.appendChild(path);
@@ -1785,6 +2289,20 @@ export class EditorCanvas {
           control.style.transform = 'translate(-50%, -50%)';
           box.appendChild(control);
         }
+        if (el.shape === 'brace') {
+          // The point: dragging it along the chord's normal sets the depth,
+          // and with it the radius of every curl; across the chord it flips.
+          const tip = braceTip(el);
+          const handle = document.createElement('div');
+          handle.className = 'handle handle-curve-control handle-brace-tip';
+          handle.dataset.braceTip = 'true';
+          handle.dataset.elementId = el.id;
+          handle.style.left = `${tip.x - el.x}px`;
+          handle.style.top = `${tip.y - el.y}px`;
+          handle.style.margin = '0';
+          handle.style.transform = 'translate(-50%, -50%)';
+          box.appendChild(handle);
+        }
         frag.appendChild(box);
         continue;
       }
@@ -1804,6 +2322,23 @@ export class EditorCanvas {
         box.appendChild(h);
       }
       if (selection.size === 1) {
+        // A straight-sided shape offers its corners. The box is rotated with
+        // the element, so corners are placed in its own unrotated frame.
+        const corners = el.type === 'shape' ? polygonPoints(el) : null;
+        if (corners && el.type === 'shape') {
+          const size = el.pathSize ?? { w: el.w, h: el.h };
+          corners.forEach((corner, index) => {
+            const h = document.createElement('div');
+            h.className = 'handle handle-corner';
+            h.dataset.corner = String(index);
+            h.dataset.elementId = el.id;
+            h.title = 'Drag to move this corner';
+            h.style.left = `${(corner.x / size.w) * el.w}px`;
+            h.style.top = `${(corner.y / size.h) * el.h}px`;
+            h.style.margin = '0';
+            box.appendChild(h);
+          });
+        }
         if (tableLayout && tableLayout.columnWidths.length > 1) {
           const total = tableLayout.columnWidths.reduce((sum, width) => sum + width, 0);
           let offset = 0;
@@ -1912,8 +2447,12 @@ export class EditorCanvas {
   }
 
   private bindPointer(): void {
-    this.host.addEventListener('pointerdown', (ev) => this.onPointerDown(ev));
+    this.host.addEventListener('pointerdown', (ev) => {
+      if (this.beginViewportPan(ev)) return;
+      this.onPointerDown(ev);
+    });
     this.host.addEventListener('pointermove', (ev) => {
+      if (this.moveViewportPan(ev)) return;
       // Covers entering the canvas with Command already held, when this window
       // did not receive the original keydown.
       if (this.drag.kind === 'none') this.setRotationModifier(commandModifier(ev));
@@ -1927,9 +2466,18 @@ export class EditorCanvas {
     this.host.addEventListener('mousemove', (ev) => {
       this.onPointerSample?.(this.toCanvas(ev));
     });
-    this.host.addEventListener('pointerup', (ev) => this.onPointerUp(ev));
-    this.host.addEventListener('pointercancel', () => this.endDrag());
+    this.host.addEventListener('pointerup', (ev) => {
+      if (this.endViewportPan(ev)) return;
+      this.onPointerUp(ev);
+    });
+    this.host.addEventListener('pointercancel', (ev) => {
+      if (this.endViewportPan(ev)) return;
+      this.endDrag();
+    });
     this.host.addEventListener('dblclick', (ev) => this.onDoubleClick(ev));
+    // A web font that finishes loading after the slide was measured changes
+    // the size of every box sized to its contents.
+    document.fonts?.addEventListener?.('loadingdone', () => this.scheduleTableHeightSync());
     this.host.addEventListener('contextmenu', (ev) => this.onContextMenu(ev));
 
     // Modifier state changes do not cause pointermove, so mirror the gesture
@@ -1990,8 +2538,11 @@ export class EditorCanvas {
     const slide = this.store.slide;
     if (!slide) return;
     // A press that reaches the canvas was not on a live page (the frame keeps
-    // those), so it is the implicit "back to editing".
-    this.endWebLive();
+    // those), so it is the implicit "back to editing". Unless it follows a
+    // pointer toggle inside the double-click window: a selection click and a
+    // quick double-click pair up early, and the double-click's own second
+    // press would otherwise end the page it just made live.
+    if (ev.timeStamp - this.mediaToggledAt > DOUBLE_CLICK_MS) this.endWebLive();
 
     // Suppress the browser's own text selection: dragging across a slide would
     // otherwise sweep-select the text of every element it crossed.
@@ -2042,7 +2593,7 @@ export class EditorCanvas {
     // turns any ordinary object handle into a rotation handle. Curve controls
     // remain dedicated to bending the curve.
     const rotationHandle = target.closest<HTMLElement>(
-      '.handle:not(.handle-curve-control)[data-element-id]',
+      '.handle:not(.handle-curve-control):not(.handle-corner)[data-element-id]',
     );
     if (commandModifier(ev) && rotationHandle?.dataset.elementId) {
       const el = slide.elements.find(
@@ -2064,6 +2615,24 @@ export class EditorCanvas {
         };
         return;
       }
+    }
+
+    // A corner of a straight-sided shape: drag it anywhere, the frame follows.
+    if (target.dataset?.corner !== undefined && target.dataset.elementId) {
+      this.store.beginTransaction('Move corner');
+      this.drag = {
+        kind: 'polygon-corner',
+        elementId: target.dataset.elementId,
+        index: Number(target.dataset.corner),
+      };
+      return;
+    }
+
+    // The point of a brace.
+    if (target.dataset?.braceTip && target.dataset.elementId) {
+      this.store.beginTransaction('Shape brace');
+      this.drag = { kind: 'brace-tip', elementId: target.dataset.elementId };
+      return;
     }
 
     // Bend handle on a quadratic line or arrow.
@@ -2100,7 +2669,7 @@ export class EditorCanvas {
       const origins = new Map<string, { start: XY; end: XY }>();
       for (const e of slide.elements) {
         if (e.id !== target.dataset.elementId && !selected.has(e.id)) continue;
-        if (e.type !== 'shape' || (e.shape !== 'line' && e.shape !== 'arrow')) continue;
+        if (!hasEndpoints(e)) continue;
         origins.set(e.id, lineEndpoints(e));
       }
       this.drag = {
@@ -2138,7 +2707,10 @@ export class EditorCanvas {
             h: selected.h,
             rot: selected.rot,
             ...((selected.type === 'image' || selected.type === 'video')
-              ? { sourceBox: selected.sourceBox ? { ...selected.sourceBox } : null }
+              ? {
+                sourceBox: selected.sourceBox ? { ...selected.sourceBox } : null,
+                fit: selected.fit,
+              }
               : {}),
             ...((selected.type === 'shape' && selected.control)
               ? { control: { ...selected.control } }
@@ -2152,7 +2724,6 @@ export class EditorCanvas {
           origin: { x: el.x, y: el.y, w: el.w, h: el.h },
           origins,
           elementId: el.id,
-          aspect: el.w / el.h,
         };
         return;
       }
@@ -2193,6 +2764,10 @@ export class EditorCanvas {
         && (hit.type === 'text' || hit.type === 'html')
         ? { elementId: hit.id, clientX: ev.clientX, clientY: ev.clientY, selectWord: secondClick }
         : null;
+      this.pendingMediaToggle = secondClick && !ev.shiftKey
+        && (hit.type === 'video' || hit.type === 'web' || hit.type === 'image')
+        ? hit.id
+        : null;
       if (!selection.has(hit.id)) {
         this.store.select([hit.id], ev.shiftKey);
       } else if (ev.shiftKey) {
@@ -2219,6 +2794,8 @@ export class EditorCanvas {
     // dragging, so collaborators see the cursor move, not only the edits.
     this.onPointerSample?.(this.toCanvas(ev));
     if (this.drag.kind === 'none') return;
+    // Only a held button drags. See `isHoverMove`.
+    if (isHoverMove(ev)) return;
     let slide = this.store.slide;
     if (!slide) return;
 
@@ -2232,7 +2809,9 @@ export class EditorCanvas {
       !this.dragStarted &&
       this.drag.kind !== 'marquee' &&
       this.drag.kind !== 'endpoint' &&
-      this.drag.kind !== 'curve-control'
+      this.drag.kind !== 'curve-control' &&
+      this.drag.kind !== 'brace-tip' &&
+      this.drag.kind !== 'polygon-corner'
     ) {
       const start = this.drag.startCanvas;
       const moved =
@@ -2437,18 +3016,24 @@ export class EditorCanvas {
           if (edges.bottom) rect.h = o.h + dy;
         }
 
-        // Shift constrains, and so does "Keep aspect ratio" on media — with it
-        // off (fit: fill) a resize genuinely stretches the picture.
-        const keepAspect =
-          (resizing?.type === 'image' || resizing?.type === 'video') &&
-          // A circular mask is square by construction; a free resize would
-          // stretch it back into the ellipse this is meant to avoid.
-          (resizing.maskShape === 'circle' ||
-            // Cropped pictures still resize proportionally. Only editing the
-            // crop window itself should bypass the media's aspect lock.
-            (resizing.fit !== 'fill' && this.maskingId !== drag.elementId));
-        const constrained = ev.shiftKey || keepAspect;
-        if (constrained) rect = constrainAspect(rect, o, edges, drag.aspect);
+        // A crop changes the window's shape, never the picture's, so it is
+        // free and Shift locks it. A resize of media follows its "Keep aspect
+        // ratio" box (any fit but 'fill'), and Shift inverts it; everything
+        // else resizes freely, Shift locking. The fit is read from the drag's
+        // origin, since a Shift-freed resize writes 'fill' mid-drag. A
+        // circular mask is square by construction, so it never frees: a free
+        // drag would stretch it back into an ellipse.
+        const media = resizing?.type === 'image' || resizing?.type === 'video';
+        const cropping = this.maskingId === drag.elementId;
+        const keepsAspect = drag.origins.get(drag.elementId)?.fit !== 'fill';
+        const constrained = media
+          ? resizing.maskShape === 'circle' || (cropping ? ev.shiftKey : keepsAspect !== ev.shiftKey)
+          : ev.shiftKey;
+        // Where the pointer is: the box a free resize would make.
+        const pointerRect = rect;
+        rect = constrained
+          ? constrainAspect(rect, o, edges)
+          : clampResize(rect, o, edges);
 
         // Guides align to what is on screen, which for a rotated neighbour is
         // its rotated bounding box, not its unrotated one.
@@ -2459,14 +3044,13 @@ export class EditorCanvas {
         // nothing meaningful to snap them to; snapping it would only nudge the
         // box away from the pointer. Alt suspends snapping outright.
         const snapped = ev.altKey || radians
-          ? { rect, guides: [], spacing: [], sizes: [] }
-          : snapResize(rect, edges, deck.canvas, others, threshold);
+          ? { rect, guides: [] }
+          : constrained
+            ? snapAspectResize(rect, pointerRect, o, edges, deck.canvas, others, threshold)
+            : snapResize(rect, edges, deck.canvas, others, threshold);
         this.guides = snapped.guides;
 
         let r = { ...snapped.rect };
-        // Snapping moves a single edge, which breaks the ratio the constraint
-        // just imposed. Re-impose it so a keep-aspect resize cannot distort.
-        if (constrained) r = constrainAspect(r, o, edges, drag.aspect);
         if (centered) {
           // Aspect constraints and snapping anchor the opposite corner, which
           // would drift the center — pin it back to where the drag started.
@@ -2510,6 +3094,9 @@ export class EditorCanvas {
           el.y = Math.round(resized.y);
           el.w = Math.max(1, Math.round(resized.w));
           el.h = Math.max(1, Math.round(resized.h));
+          // A hand-sized box is an ordinary wrapping box from here on: the
+          // author just chose its width, which hugging the text would undo.
+          if (el.type === 'text' && el.autoSize) delete el.autoSize;
           // Resizing a cropped element scales the whole picture with its
           // window, so the crop composition is preserved — without this, a
           // resize silently re-crops instead of scaling.
@@ -2522,6 +3109,12 @@ export class EditorCanvas {
               w: Math.max(1, Math.round(origin.sourceBox.w * fx)),
               h: Math.max(1, Math.round(origin.sourceBox.h * fy)),
             };
+          }
+          if ((el.type === 'image' || el.type === 'video') && origin.fit) {
+            // A freed picture squashes with its box: it fills the box (or its
+            // scaled crop) exactly instead of letterboxing inside it. Letting
+            // go of Shift mid-drag gives it back the fit it had.
+            el.fit = media && !constrained ? 'fill' : origin.fit;
           }
           if (el.type === 'shape' && origin.control) {
             const control = resizePointByScale(origin.control, origin, resized, scaleX, scaleY);
@@ -2619,6 +3212,26 @@ export class EditorCanvas {
         break;
       }
 
+      case 'brace-tip': {
+        const drag = this.drag;
+        this.store.updateSelected((target) => {
+          if (target.id === drag.elementId && target.type === 'shape') {
+            target.braceDepth = Math.round(braceDepthToward(target, point));
+          }
+        });
+        break;
+      }
+
+      case 'polygon-corner': {
+        const drag = this.drag;
+        this.store.updateSelected((target) => {
+          if (target.id === drag.elementId && target.type === 'shape') {
+            moveCorner(target, drag.index, point);
+          }
+        });
+        break;
+      }
+
       case 'marquee': {
         const s = this.drag.startCanvas;
         this.marquee = {
@@ -2649,6 +3262,8 @@ export class EditorCanvas {
       return;
     }
     const textEdit = !this.dragStarted ? this.pendingTextEdit : null;
+    const mediaToggle = !this.dragStarted ? this.pendingMediaToggle : null;
+    this.pendingMediaToggle = null;
     if (this.drag.kind === 'marquee' && this.marquee) {
       const slide = this.store.slide;
       if (slide) {
@@ -2663,6 +3278,39 @@ export class EditorCanvas {
     this.host.releasePointerCapture?.(ev.pointerId);
     this.endDrag();
     if (textEdit) this.beginTextEdit(textEdit.elementId, textEdit, textEdit.selectWord);
+    if (mediaToggle) {
+      this.mediaToggledAt = ev.timeStamp;
+      this.toggleMedia(mediaToggle);
+    }
+  }
+
+  /**
+   * Grow or shrink a sized-to-text box with each keystroke. Only the DOM and
+   * the selection outline follow: the store learns the size from the
+   * measurement pass once the edit commits, so typing never interleaves
+   * geometry commits with the edit session's own.
+   */
+  private followTextSizeWhileEditing(node: HTMLElement, elementId: string): void {
+    const slide = this.store.slide;
+    const el = slide?.elements.find((candidate) => candidate.id === elementId);
+    if (!slide || el?.type !== 'text') return;
+    const box = measureTextToSize(node, el);
+    if (!box) return;
+    node.style.left = `${box.x}px`;
+    node.style.width = `${box.w}px`;
+    node.style.height = `${box.h}px`;
+    this.drawOverlay(
+      this.store.get().deck,
+      slide.elements.map((candidate) => (candidate.id === elementId ? { ...candidate, ...box } : candidate)),
+      this.store.get().selection,
+    );
+  }
+
+  private toggleMedia(elementId: string): void {
+    const el = this.store.slide?.elements.find((e) => e.id === elementId);
+    if (el?.type === 'video') this.toggleVideo(elementId);
+    else if (el?.type === 'web') this.toggleWebLive(elementId);
+    else if (el?.type === 'image') this.toggleMaskMode(elementId);
   }
 
   private endDrag(): void {
@@ -2676,6 +3324,7 @@ export class EditorCanvas {
     this.sizeMatches = [];
     this.marquee = null;
     this.pendingTextEdit = null;
+    this.pendingMediaToggle = null;
 
     // Deliberately *not* a full render. Redrawing the slide layer here would
     // replace the node the pointer went down on, and a browser cannot
@@ -2688,57 +3337,49 @@ export class EditorCanvas {
     if (slide) this.drawOverlay(deck, slide.elements, selection);
   }
 
-  /** Custom context menu: right-click selects the element and offers actions. */
   /**
-   * Comments popover for one element. Public so the context menu's "Add
-   * comment…" can open it; the badge drawn by drawOverlay uses it too.
+   * The comment threads on one object (or, with no id, everything on the
+   * current slide), opened from the right-click menu beside `at`.
    */
-  openElementComments(elementId: string, anchor?: DOMRect): void {
+  openComments(elementId: string | null, at?: { x: number; y: number }, opts: { compose?: boolean; threadId?: string } = {}): void {
     const slideId = this.store.slide?.id;
     if (!slideId) return;
-    const find = (deck: Deck) =>
-      deck.slides.find((s) => s.id === slideId)?.elements.find((e) => e.id === elementId);
-    const current = () => find(this.store.get().deck)?.comments ?? [];
-    // Anchor on the element's on-screen box when the caller has no badge rect.
-    const node = this.slideLayer.querySelector<HTMLElement>(
-      `[data-element-id="${CSS.escape(elementId)}"]`,
-    );
-    const at = anchor ?? node?.getBoundingClientRect();
-    if (!at) return;
-    const mutate = (label: string, fn: (el: SlideElement) => void) => {
-      this.store.commit((deck) => {
-        const el = find(deck);
-        if (el) fn(el);
-      }, { label });
-      pop.refresh(current());
-    };
-    const pop = openCommentsPopover({
-      anchor: at,
-      title: 'Comments',
-      comments: current(),
-      onAdd: (text) => mutate('Add comment', (el) => {
-        (el.comments ??= []).push(newComment(text));
-      }),
-      onResolve: (id, resolved) => mutate(resolved ? 'Resolve comment' : 'Reopen comment', (el) => {
-        const comment = el.comments?.find((c) => c.id === id);
-        if (comment) comment.resolved = resolved;
-      }),
-      onDelete: (id) => mutate('Delete comment', (el) => {
-        el.comments = (el.comments ?? []).filter((c) => c.id !== id);
-        if (el.comments.length === 0) delete el.comments;
-      }),
+    const node = elementId
+      ? this.slideLayer.querySelector<HTMLElement>(`[data-element-id="${CSS.escape(elementId)}"]`)
+      : null;
+    const anchor = at ?? node?.getBoundingClientRect() ?? this.lastContextPoint ?? this.stage.getBoundingClientRect();
+    openComments({
+      store: this.store,
+      slideId,
+      ...(elementId ? { elementId } : {}),
+      anchor,
+      ...opts,
+      reveal: (target) => {
+        if (target.elementId) this.store.select([target.elementId]);
+      },
     });
   }
 
+  /** Where the last right-click landed: a slide's comments open there. */
+  private lastContextPoint: { x: number; y: number } | null = null;
+
+  /** Custom context menu: right-click selects the element and offers actions. */
   private onContextMenu(ev: MouseEvent): void {
     ev.preventDefault();
+    this.lastContextPoint = { x: ev.clientX, y: ev.clientY };
     document.getElementById('ctx-menu')?.remove();
-    if (!this.contextActions) return;
+    // Inside the box being edited the menu leads with spelling: fixes for the
+    // flagged word under the pointer, then the on/off switch.
+    const spelling = this.editingId ? this.spellingMenuItems(ev.clientX, ev.clientY) : [];
+    if (!this.contextActions && spelling.length === 0) return;
 
     const hit = this.hitTest(this.toCanvas(ev as PointerEvent));
     if (hit && !this.store.get().selection.has(hit.id)) this.store.select([hit.id]);
 
-    const items = this.contextActions(hit);
+    const actions = this.contextActions?.(hit) ?? [];
+    const items: Array<ContextMenuEntry> = actions.length
+      ? [...spelling, 'separator', ...actions]
+      : spelling;
     if (items.length === 0) return;
 
     const menu = document.createElement('div');
@@ -2750,8 +3391,23 @@ export class EditorCanvas {
         menu.appendChild(hr);
         continue;
       }
+      if ('heading' in item) {
+        const heading = document.createElement('div');
+        heading.className = 'ctx-heading';
+        heading.textContent = item.heading;
+        heading.title = item.title ?? '';
+        menu.appendChild(heading);
+        continue;
+      }
       const row = document.createElement('button');
       row.textContent = item.label;
+      if (item.checked !== undefined) {
+        row.className = 'ctx-check';
+        row.setAttribute('role', 'menuitemcheckbox');
+        row.setAttribute('aria-checked', String(item.checked));
+      }
+      // Keep the caret (and the edit session) in the text box.
+      row.addEventListener('mousedown', (event) => event.preventDefault());
       row.addEventListener('click', () => {
         menu.remove();
         item.action();
@@ -2768,7 +3424,7 @@ export class EditorCanvas {
 
   /**
    * Double-click means "get into" the thing under the cursor: edit a text box,
-   * play a video, open the trim window for nothing else.
+   * play a video, crop a picture (and double-click again to leave the crop).
    */
   private onDoubleClick(ev: PointerEvent | MouseEvent): void {
     // Once editing is active, native browser double-click selection owns this
@@ -2820,10 +3476,24 @@ export class EditorCanvas {
 
     if (hit.type === 'text' || hit.type === 'html') {
       this.beginTextEdit(hit.id);
-    } else if (hit.type === 'video') {
-      this.toggleVideo(hit.id);
-    } else if (hit.type === 'web') {
-      this.toggleWebLive(hit.id);
+    } else if (hit.type === 'shape' && canHoldText(hit)) {
+      // Typing into a rectangle or an ellipse makes it a text box with the
+      // same fill, border and corners: one object, not a label laid over a
+      // shape. The store renders synchronously, so the box is on the canvas
+      // by the time the edit opens.
+      const index = this.store.get().slideIndex;
+      this.store.commit((deck) => {
+        const elements = deck.slides[index].elements;
+        const at = elements.findIndex((candidate) => candidate.id === hit.id);
+        const shape = elements[at];
+        if (shape?.type === 'shape') elements[at] = shapeToTextBox(shape);
+      }, { label: 'Add text to shape' });
+      this.beginTextEdit(hit.id);
+    } else if (hit.type === 'video' || hit.type === 'web' || hit.type === 'image') {
+      // Browsers that do dispatch dblclick (Chromium) already had the pair
+      // toggled on its second pointer-up; toggling again would undo it.
+      if (ev.timeStamp - this.mediaToggledAt <= DOUBLE_CLICK_MS) return;
+      this.toggleMedia(hit.id);
     }
   }
 
@@ -2925,10 +3595,7 @@ export class EditorCanvas {
     return active instanceof HTMLElement
       && active !== content && !content.contains(active)
       && active.matches('input, select, textarea')
-      && Boolean(active.closest(
-        '.editor-inspector, .font-family-field, .text-table-options,'
-        + ' .text-list-toggle, .color-picker-popover',
-      ));
+      && Boolean(active.closest(TEXT_EDIT_PANEL_CHROME));
   }
 
   private focusTextSurface(content: HTMLElement): void {
@@ -3041,6 +3708,8 @@ export class EditorCanvas {
     // jsdom has no execCommand; the editing command is a browser-only nicety.
     document.execCommand?.('defaultParagraphSeparator', false, 'p');
     body.contentEditable = 'true';
+    // Harper (this.spelling) checks the box; Chromium's own squiggles would
+    // double up on top of it.
     body.spellcheck = false;
     body.style.outline = 'none';
     body.style.cursor = 'text';
@@ -3078,6 +3747,7 @@ export class EditorCanvas {
     this.textEditDomBase = authoredTextHtml(body);
     this.textEditRevertHtml = el.html;
     this.onTextEditModeChange?.(elementId);
+    this.spelling.attach(body);
 
     // Live sync: stream the box's content to the store (and thus to
     // collaborators) while typing, throttled to one commit per interval. The
@@ -3096,13 +3766,17 @@ export class EditorCanvas {
     // (the pinyin "ni" under the candidate window). Streaming or sealing it
     // would persist — and make undoable — text the author never committed.
     let composing = false;
+    this.textEditComposing = false;
     const pushLive = () => {
       liveTimer = 0;
       if (ended || this.editingId !== elementId) return;
       if (composing) return;
-      const html = authoredTextHtml(body);
       const current = findTextTarget(this.store.get().deck, elementId);
       if (!current) return;
+      // A collaborator's change that landed mid-composition was left for
+      // later: take it in before streaming over it.
+      if (this.liveTextSync) this.adoptRemoteEditedHtml(current, true);
+      const html = authoredTextHtml(body);
       if (current.html === html) return;
       // A peer moved the store past this session's sync point and nothing is
       // unsent here: streaming the stale DOM would revert their edit.
@@ -3118,6 +3792,7 @@ export class EditorCanvas {
           target.html = html;
           // Same placeholder retirement as the seal (see sealTextChunk).
           target.class = target.class.filter((name) => name !== 'placeholder');
+          this.fitEditedText(target);
         }
       }, { label: 'Edit text', transient: true, coalesceKey });
       this.textEditStoreBase = html;
@@ -3157,9 +3832,11 @@ export class EditorCanvas {
         return;
       }
       lastEditKind = null;
-      const html = authoredTextHtml(body);
       const current = findTextTarget(this.store.get().deck, elementId);
       if (!current) return;
+      // As in pushLive: a collaborator's change left for after a composition.
+      if (this.liveTextSync) this.adoptRemoteEditedHtml(current, true);
+      const html = authoredTextHtml(body);
       // Live sync may already have streamed this exact html under the current
       // key. There is then nothing to commit — but the run is still over, so
       // the key must move on either way, or the next word would join this
@@ -3181,6 +3858,7 @@ export class EditorCanvas {
             // re-entered editing, re-stripped the class, and no number of
             // Ctrl/Cmd+Z presses ever reached the text.
             target.class = target.class.filter((name) => name !== 'placeholder');
+            this.fitEditedText(target);
           }
         }, { label: 'Edit text', coalesceKey, historyGroup: `text:${elementId}` });
         this.textEditStoreBase = html;
@@ -3208,6 +3886,7 @@ export class EditorCanvas {
     let compositionPendingStyle: string | null = null;
     const onCompositionStart = () => {
       composing = true;
+      this.textEditComposing = true;
       const range = this.activeTextRange(body);
       const container = range?.startContainer instanceof Element
         ? range.startContainer
@@ -3253,6 +3932,7 @@ export class EditorCanvas {
     };
     const onCompositionEnd = (event: CompositionEvent) => {
       composing = false;
+      this.textEditComposing = false;
       if (event.data && compositionPendingStyle) {
         adoptComposedText(event.data, compositionPendingStyle);
       }
@@ -3261,9 +3941,33 @@ export class EditorCanvas {
       scheduleIdleSeal();
     };
 
+    /**
+     * A clipboard that carries pictures or video alongside its text (a web
+     * page, a chat message, another editor) pastes only its text here. The
+     * browser's own paste would put the media inside the text -- as a
+     * `data:` URI, bytes and all -- where no control can reach it and every
+     * collaborator downloads it with each edit of the box.
+     */
+    const pasteTextWithoutMedia = (event: ClipboardEvent, pasted: string, plainText: string) => {
+      event.preventDefault();
+      const html = textOnlyPastedHtml(pasted);
+      const template = document.createElement('template');
+      template.innerHTML = html;
+      if ((template.content.textContent ?? '').trim()) {
+        document.execCommand('insertHTML', false, html);
+      } else if (plainText.trim()) {
+        document.execCommand('insertText', false, plainText);
+      }
+      repairPastedMarkup();
+      this.textSelectionRange = this.activeTextRange(body)?.cloneRange() ?? null;
+      sealTextChunk();
+      this.notice('Pasted text only: pictures and video are not placed inside a text box.');
+    };
+
     const onPaste = (event: ClipboardEvent) => {
       const pasted = event.clipboardData?.getData('text/html') ?? '';
       const plainText = event.clipboardData?.getData('text/plain') ?? '';
+      pastedFit = copiedFit && collapsedText(plainText) === copiedFit.text ? copiedFit.size : null;
 
       // Pasting a URL onto selected text links that text rather than
       // replacing it, the way it works in Slack and every other chat app.
@@ -3292,7 +3996,10 @@ export class EditorCanvas {
 
       const tableData = pastedTableData(pasted, plainText);
       const safeTable = tableData?.html ?? null;
-      if (!safeTable || !tableData) return;
+      if (!safeTable || !tableData) {
+        if (pasted && pastedHtmlHasMedia(pasted)) pasteTextWithoutMedia(event, pasted, plainText);
+        return;
+      }
       const template = document.createElement('template');
       template.innerHTML = safeTable;
       const table = template.content.querySelector('table')!;
@@ -3445,7 +4152,7 @@ export class EditorCanvas {
         const edge = cell ? borderEdgeAtPointer(cell, event) : null;
         if (cell && edge) {
           this.showTableBorderPreview(cell, edge);
-          if (borderPaintDrag?.pointerId === event.pointerId) {
+          if (borderPaintDrag?.pointerId === event.pointerId && !isHoverMove(event)) {
             event.preventDefault();
             this.paintTableBorderEdge(cell, edge);
             borderPaintDrag.changed = true;
@@ -3455,7 +4162,7 @@ export class EditorCanvas {
         }
         return;
       }
-      if (!tableDrag || event.pointerId !== tableDrag.pointerId) return;
+      if (!tableDrag || event.pointerId !== tableDrag.pointerId || isHoverMove(event)) return;
       const cell = tableCellFromEvent(event);
       if (!cell) return;
       const point = tableCoordinates(cell);
@@ -3501,6 +4208,8 @@ export class EditorCanvas {
 
     const finish = (commit: boolean) => {
       ended = true;
+      this.textEditComposing = false;
+      this.spelling.detach();
       if (this.finishTextEdit === finish) this.finishTextEdit = null;
       if (this.sealTextChunk === sealTextChunk) this.sealTextChunk = null;
       if (idleSeal) {
@@ -3511,6 +4220,8 @@ export class EditorCanvas {
       body.removeEventListener('keydown', onKey);
       body.removeEventListener('beforeinput', onBeforeInput);
       body.removeEventListener('input', onInput);
+      body.removeEventListener('copy', onCopyOrCut);
+      body.removeEventListener('cut', onCopyOrCut);
       body.removeEventListener('paste', onPaste);
       body.removeEventListener('compositionstart', onCompositionStart);
       body.removeEventListener('compositionend', onCompositionEnd);
@@ -3576,15 +4287,14 @@ export class EditorCanvas {
       if (event.isTrusted && !event.relatedTarget && !document.hasFocus()) return;
       // Native selects need focus in order to open. Keep the live Range while
       // the font picker is used; its change handler restores focus afterward.
+      // A table row/column selection is a formatting target in its own right:
+      // typography fields take focus without ending the edit and clearing
+      // that target before their change handlers run. While focus is there
+      // the bookmarked characters stay painted (keptSelection.ts), from the
+      // same list, so what keeps the edit alive and what keeps it visible
+      // cannot drift apart.
       if (event.relatedTarget instanceof Element
-        && event.relatedTarget.closest(
-          '.font-family-field, .text-table-options, .text-list-toggle, .color-picker-popover',
-        )) return;
-      // A table row/column selection is a formatting target in its own right.
-      // Let typography fields take focus without ending the edit and clearing
-      // that target before their change handlers run.
-      if (event.relatedTarget instanceof Element
-        && event.relatedTarget.closest('.editor-inspector')) return;
+        && event.relatedTarget.closest(TEXT_EDIT_PANEL_CHROME)) return;
       finish(true);
     };
     /**
@@ -3597,6 +4307,7 @@ export class EditorCanvas {
      * the text came from — list conversion in particular needs real blocks.
      */
     const repairPastedMarkup = () => {
+      deleteStraySentinels(body);
       const range = this.activeTextRange(body);
       const offsets = range ? this.textOffsetsForRange(body, range) : null;
       const normalized = normalizeParagraphHtml(sanitizePastedTextHtml(body.innerHTML), true);
@@ -3647,6 +4358,8 @@ export class EditorCanvas {
      * Chromium splits the paragraph and re-established on the line it opens.
      */
     let breakFormats: TypingFormats | null = null;
+    /** The fitted size the text being pasted was copied at, if it came from an auto-fit box. */
+    let pastedFit: string | null = null;
     const onInput = (event?: Event) => {
       const typed = event instanceof InputEvent ? event : null;
       if (typed?.inputType === 'insertParagraph') {
@@ -3663,8 +4376,15 @@ export class EditorCanvas {
         // declarations on the way in; every other structural input has to as
         // well, or the box saves an indent no control can reach. Plain typing
         // is left alone: it never restructures anything, and it is hot.
-        stripLayoutDeclarations(body);
+        stripLayoutDeclarations(body, { keepLineSpacing: true });
+        // In an auto-fit box the computed style a join copies includes the
+        // fitted size, which would freeze the moved text at it.
+        if (body.dataset.fittedFontSize !== undefined && body.style.fontSize) {
+          stripFittedFontSize(body, body.style.fontSize);
+        }
+        if (typed.inputType === 'insertFromPaste' && pastedFit) stripFittedFontSize(body, pastedFit);
       }
+      if (typed?.inputType === 'insertFromPaste') pastedFit = null;
       if (typed?.inputType.startsWith('delete')) {
         repairEmptiedBox();
         // Deleting a selection that spans a whole cell's text can take the
@@ -3696,7 +4416,8 @@ export class EditorCanvas {
         // The space that ends a URL is the moment it becomes a link.
         linkifyTypedUrl();
       }
-      if (el.type === 'text' && (el.autoFit || el.noWrap)) scheduleAutoFit(node!);
+      if (el.type === 'text' && (el.autoFit || el.noWrap) && !el.autoSize) scheduleAutoFit(node!);
+      if (el.type === 'text' && el.autoSize) this.followTextSizeWhileEditing(node!, el.id);
       if (this.liveTextSync && !liveTimer) liveTimer = window.setTimeout(pushLive, 250);
 
       const inputType = typed?.inputType ?? '';
@@ -3837,6 +4558,9 @@ export class EditorCanvas {
         this.toggleTextSelectionFormat(
           e.key === '=' || e.key === '+' ? 'superscript' : 'subscript',
         );
+      } else if (this.handleZoomShortcut(e)) {
+        // The unshifted chords zoom the canvas here too: they mean nothing to
+        // the text, and would otherwise zoom the whole page.
       } else if ((e.metaKey || e.ctrlKey) && ['b', 'i', 'u'].includes(e.key.toLowerCase())) {
         e.preventDefault();
         const format = e.key.toLowerCase() === 'b'
@@ -3947,6 +4671,15 @@ export class EditorCanvas {
     body.addEventListener('keydown', onKey);
     this.finishTextEdit = finish;
     body.addEventListener('beforeinput', onBeforeInput);
+    // Before Chromium serializes the selection for the clipboard.
+    const onCopyOrCut = () => {
+      settleTypedMarkers(body);
+      const size = body.dataset.fittedFontSize !== undefined ? body.style.fontSize : '';
+      const text = collapsedText(window.getSelection()?.toString() ?? '');
+      copiedFit = size && text ? { text, size } : null;
+    };
+    body.addEventListener('copy', onCopyOrCut);
+    body.addEventListener('cut', onCopyOrCut);
     body.addEventListener('input', onInput);
     body.addEventListener('paste', onPaste);
     body.addEventListener('compositionstart', onCompositionStart);
@@ -4122,7 +4855,12 @@ export class EditorCanvas {
     }
   }
 
-  private restoreTextRange(root: HTMLElement, offsets: { start: number; end: number }): void {
+  private restoreTextRange(
+    root: HTMLElement,
+    offsets: { start: number; end: number },
+    /** Which side a collapsed caret takes where two text nodes meet. */
+    caretAffinity: 'forward' | 'backward' = 'forward',
+  ): void {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const texts: Text[] = [];
     for (let current = walker.nextNode(); current; current = walker.nextNode()) {
@@ -4143,7 +4881,7 @@ export class EditorCanvas {
       const last = texts[texts.length - 1];
       return { node: last, offset: last.data.length };
     };
-    const start = locate(offsets.start, 'forward');
+    const start = locate(offsets.start, offsets.end === offsets.start ? caretAffinity : 'forward');
     const end = offsets.end === offsets.start
       ? start
       : locate(Math.max(offsets.start, offsets.end), 'backward');
@@ -4640,6 +5378,7 @@ export class EditorCanvas {
     this.editingId = null;
     this.tableSelection = null;
     this.textSelectionRange = null;
+    this.spelling.detach();
     this.onTextEditModeChange?.(null);
 
     const node = this.slideLayer.querySelector<HTMLElement>(
@@ -4700,6 +5439,9 @@ export class EditorCanvas {
       // mode; plain text is left in place because restoreRenderedForm detects
       // identical markup.
       this.restoreRenderedForm(current, body);
+      // Nothing re-renders, so nothing else would fit a box sized to its text
+      // to the text it was left holding.
+      this.scheduleTableHeightSync();
       // Live formatting/table commits already recorded the authored change.
       // Do not add a second no-op history entry when edit mode finishes; one
       // real Ctrl/Cmd+Z must undo one real formatting click.
@@ -4711,6 +5453,7 @@ export class EditorCanvas {
       if (el) {
         el.html = html;
         el.class = el.class.filter((name) => name !== 'placeholder');
+        this.fitEditedText(el);
       }
     }, { label: 'Edit text', coalesceKey, historyGroup: `text:${elementId}` });
   }
@@ -4786,32 +5529,48 @@ export class EditorCanvas {
     return this.applyTextSelectionStyle('fontSize', `${size}px`);
   }
 
-  /** Apply paragraph spacing to the blocks touched by the live selection. */
-  applyTextSelectionParagraphSpacing(value: number | null): boolean {
-    if (!this.editingId || this.tableSelection) return false;
+  /**
+   * The editing box's content and the blocks a text selection touches, for
+   * the controls that set a block property (paragraph and line spacing). The
+   * live selection is preferred; the remembered one serves while focus sits
+   * in the inspector field being typed into.
+   */
+  private selectedTextBlocks(live: boolean): { content: HTMLElement; blocks: HTMLElement[] } | null {
+    if (!this.editingId || this.tableSelection) return null;
     const content = this.slideLayer.querySelector<HTMLElement>(
       `[data-element-id="${CSS.escape(this.editingId)}"] .text-content`,
     );
-    const live = window.getSelection();
-    const range = live && live.rangeCount > 0 && !live.getRangeAt(0).collapsed
-      ? live.getRangeAt(0)
+    const selection = live ? window.getSelection() : null;
+    const range = selection && selection.rangeCount > 0 && !selection.getRangeAt(0).collapsed
+      ? selection.getRangeAt(0)
       : this.textSelectionRange;
     if (!content || !range || range.collapsed || !content.contains(range.commonAncestorContainer)) {
-      return false;
+      return null;
     }
-    const blocks = [...content.querySelectorAll<HTMLElement>('p, li, div')]
-      .filter((block) => {
-        try { return range.intersectsNode(block); } catch { return false; }
-      })
-      .filter((block) => !block.querySelector('p, li, div'));
-    if (blocks.length === 0) return false;
+    const blocks = leafTextBlocks(content).filter((block) => {
+      try { return range.intersectsNode(block); } catch { return false; }
+    });
+    return blocks.length > 0 ? { content, blocks } : null;
+  }
 
-    const spacing = value === null ? null : `${Math.max(0, value)}px`;
+  /**
+   * Write `property` on every block the selection touches (or clear it with
+   * null), keep those blocks selected, and commit the change as one step.
+   */
+  private applyTextSelectionBlockStyle(
+    property: 'margin-bottom' | 'line-height',
+    value: string | null,
+    label: string,
+  ): boolean {
+    const target = this.selectedTextBlocks(true);
+    if (!target) return false;
+    const { content, blocks } = target;
     blocks.forEach((block) => {
-      if (spacing === null) block.style.removeProperty('margin-bottom');
-      else block.style.marginBottom = spacing;
+      if (value === null) block.style.removeProperty(property);
+      else block.style.setProperty(property, value);
       if (!block.getAttribute('style')?.trim()) block.removeAttribute('style');
     });
+    const live = window.getSelection();
     const next = document.createRange();
     next.setStartBefore(blocks[0]);
     next.setEndAfter(blocks[blocks.length - 1]);
@@ -4821,29 +5580,45 @@ export class EditorCanvas {
     this.focusTextSurface(content);
     const node = content.closest<HTMLElement>('.element');
     if (node) scheduleAutoFit(node);
-    this.commitLiveTextDom(
-      spacing === null ? 'Use theme spacing for selected paragraphs' : 'Change selected paragraph spacing',
-    );
+    this.commitLiveTextDom(label);
     return true;
+  }
+
+  /** Apply paragraph spacing to the blocks touched by the live selection. */
+  applyTextSelectionParagraphSpacing(value: number | null): boolean {
+    return this.applyTextSelectionBlockStyle(
+      'margin-bottom',
+      value === null ? null : `${Math.max(0, value)}px`,
+      value === null ? 'Use theme spacing for selected paragraphs' : 'Change selected paragraph spacing',
+    );
   }
 
   /** Return a shared authored spacing for the paragraphs in the live selection. */
   textSelectionParagraphSpacing(): number | null {
-    if (!this.editingId || this.tableSelection) return null;
-    const content = this.slideLayer.querySelector<HTMLElement>(
-      `[data-element-id="${CSS.escape(this.editingId)}"] .text-content`,
+    const target = this.selectedTextBlocks(false);
+    if (!target) return null;
+    const values = target.blocks.map((block) => Number.parseFloat(block.style.marginBottom));
+    if (values.some((value) => !Number.isFinite(value))) return null;
+    return values.every((value) => value === values[0]) ? values[0] : null;
+  }
+
+  /**
+   * Set the line spacing (a ratio of the font size) of the paragraphs the
+   * live selection touches; null hands them back to the box's spacing.
+   */
+  applyTextSelectionLineHeight(value: number | null): boolean {
+    return this.applyTextSelectionBlockStyle(
+      'line-height',
+      value === null ? null : String(lineSpacingValue(value)),
+      value === null ? 'Use box line spacing for selected paragraphs' : 'Change selected line spacing',
     );
-    const range = this.textSelectionRange;
-    if (!content || !range || range.collapsed || !content.contains(range.commonAncestorContainer)) {
-      return null;
-    }
-    const blocks = [...content.querySelectorAll<HTMLElement>('p, li, div')]
-      .filter((block) => {
-        try { return range.intersectsNode(block); } catch { return false; }
-      })
-      .filter((block) => !block.querySelector('p, li, div'));
-    if (blocks.length === 0) return null;
-    const values = blocks.map((block) => Number.parseFloat(block.style.marginBottom));
+  }
+
+  /** The line spacing the paragraphs in the selection share, if they declare one. */
+  textSelectionLineHeight(): number | null {
+    const target = this.selectedTextBlocks(false);
+    if (!target) return null;
+    const values = target.blocks.map((block) => Number(block.style.lineHeight || Number.NaN));
     if (values.some((value) => !Number.isFinite(value))) return null;
     return values.every((value) => value === values[0]) ? values[0] : null;
   }
@@ -5372,6 +6147,62 @@ export class EditorCanvas {
     return false;
   }
 
+  /** Right-click entries for the flagged word at a point, plus the switch. */
+  private spellingMenuItems(x: number, y: number): ContextMenuEntry[] {
+    const items: ContextMenuEntry[] = [];
+    const found = this.spelling.isEnabled ? this.spelling.lintAtPoint(x, y) : null;
+    if (found) {
+      const { lint, range } = found;
+      const word = range.toString();
+      items.push({ heading: lint.kind === 'spelling' ? 'Spelling' : 'Grammar', title: lint.message });
+      for (const suggestion of lint.suggestions) {
+        items.push({
+          label: suggestion === '' ? `Remove "${word}"` : suggestion,
+          action: () => this.applySpellingFix(range, suggestion),
+        });
+      }
+      if (lint.kind === 'spelling' && /^\S+$/.test(word)) {
+        items.push({ label: `Add "${word}" to dictionary`, action: () => void this.spelling.addWord(word) });
+      }
+      items.push({ label: 'Ignore', action: () => this.spelling.ignore(lint) });
+      items.push('separator');
+    }
+    const on = this.spelling.isEnabled;
+    items.push({ label: 'Check spelling and grammar', checked: on, action: () => this.spelling.setEnabled(!on) });
+    return items;
+  }
+
+  /**
+   * Replace a flagged range in the box being edited with a suggestion, as its
+   * own undo step ("Fix spelling") through the same commit path as formatting.
+   */
+  applySpellingFix(range: Range, replacement: string): void {
+    const elementId = this.editingId;
+    if (!elementId) return;
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(elementId)}"] .text-content`,
+    );
+    if (!body || !body.contains(range.commonAncestorContainer)) return;
+    // The run being typed is its own undo step, not part of the fix.
+    this.sealTextChunk?.();
+    range.deleteContents();
+    const caret = document.createRange();
+    if (replacement) {
+      const text = document.createTextNode(replacement);
+      range.insertNode(text);
+      caret.setStartAfter(text);
+    } else {
+      caret.setStart(range.startContainer, range.startOffset);
+    }
+    caret.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(caret);
+    this.textSelectionRange = caret.cloneRange();
+    this.commitLiveTextDom('Fix spelling');
+    this.spelling.recheck();
+  }
+
   private commitLiveTextDom(label: string): void {
     const elementId = this.editingId;
     if (!elementId) return;
@@ -5391,6 +6222,7 @@ export class EditorCanvas {
         // A formatting click is a real edit too: retire placeholder status
         // inside this entry (see sealTextChunk for the undo-jam this avoids).
         target.class = target.class.filter((name) => name !== 'placeholder');
+        this.fitEditedText(target);
       }
     }, { label, coalesceKey, historyGroup: `text:${elementId}` });
     this.textEditStoreBase = html;
@@ -5538,18 +6370,22 @@ export class EditorCanvas {
       : [];
     const keepProportional = absoluteSize && proportional.some((value) => !value);
 
+    const selectedTexts = new Set<Text>();
     slices.forEach(({ text, start, end }, index) => {
+      if (end < text.data.length) text.splitText(end);
+      const selected = start > 0 ? text.splitText(start) : text;
+      selectedTexts.add(selected);
       const applied = keepProportional && proportional[index]
         ? declarations.filter(([property]) => property !== 'fontSize')
         : declarations;
       if (applied.length === 0) return;
-      if (end < text.data.length) text.splitText(end);
-      const selected = start > 0 ? text.splitText(start) : text;
       const span = document.createElement('span');
       for (const [property, value] of applied) span.style[property] = value;
       selected.replaceWith(span);
       span.appendChild(selected);
     });
+    const size = declarations.find(([property]) => property === 'fontSize')?.[1];
+    if (absoluteSize && size) sizeWholeBlocks(content, selectedTexts, size);
     normalizeInlineStyleSpans(content);
     // Chromium can move a selected trailing space out of its inline wrapper.
     // When that wrapper sits beside a block (notably a paragraph pasted into a
@@ -5854,6 +6690,7 @@ export class EditorCanvas {
     fontWeightExplicit: boolean;
     fittedFontSize: number | null;
     paragraphSpacing: number | null;
+    lineHeight: number | null;
   } {
     const element = this.slideLayer.querySelector<HTMLElement>(
       `[data-element-id="${CSS.escape(elementId)}"]`,
@@ -5883,6 +6720,7 @@ export class EditorCanvas {
         fontWeightExplicit: false,
         fittedFontSize: null,
         paragraphSpacing: null,
+        lineHeight: null,
       };
     }
     const style = getComputedStyle(target);
@@ -5931,6 +6769,7 @@ export class EditorCanvas {
       fontWeightExplicit: explicit('fontWeight'),
       fittedFontSize: Number.isFinite(fittedFontSize) ? fittedFontSize : null,
       paragraphSpacing: Number.isFinite(paragraphSpacing) ? paragraphSpacing : 0,
+      lineHeight: lineSpacingOf(target, node),
     };
   }
 
@@ -6280,7 +7119,7 @@ export class EditorCanvas {
                   ...base,
                   type: 'video',
                   src,
-                  fit: 'contain',
+                  fit: NEW_MEDIA_FIT,
                   autoplay: true,
                   loop: true,
                   muted: true,
@@ -6294,7 +7133,7 @@ export class EditorCanvas {
                   ...base,
                   type: 'image',
                   src,
-                  fit: 'contain',
+                  fit: NEW_MEDIA_FIT,
                   alt: drop.file.name,
                   sourceBox: null,
                 },
@@ -6368,7 +7207,7 @@ export class EditorCanvas {
         class: [],
         style: {},
         src: makePendingSrc(id, webImageName(source)),
-        fit: 'contain',
+        fit: NEW_MEDIA_FIT,
         alt: webImageName(source),
         sourceBox: null,
       });
@@ -6590,6 +7429,11 @@ export function elementContainsPoint(
   point: { x: number; y: number },
   tolerance = LINE_HIT_SCREEN_PX,
 ): boolean {
+  if (el.type === 'shape' && el.shape === 'brace') {
+    const points = bracePolyline(el);
+    const reach = Math.max(tolerance, el.strokeWidth / 2);
+    return points.slice(1).some((next, i) => distanceToSegment(point, points[i], next) <= reach);
+  }
   if (el.type === 'shape' && (el.shape === 'line' || el.shape === 'arrow')) {
     const { start, end } = lineEndpoints(el);
     if (el.control) {
@@ -6674,6 +7518,70 @@ export function elementContainsPoint(
     y >= el.y && y <= el.y + el.h;
 }
 
+/**
+ * The box a sized-to-text element should have, from its rendered node, or
+ * null when it already has it (within a pixel) or cannot be measured.
+ *
+ * The text is laid out at its natural width (it never soft-wraps, see
+ * type.css), and whatever separates the box from its text — the body's
+ * padding, borders — is carried over unchanged. The box stays put at the
+ * edge its alignment names and at its top.
+ */
+export function measureTextToSize(
+  node: HTMLElement,
+  el: TextEl,
+): { x: number; w: number; h: number } | null {
+  const body = node.querySelector<HTMLElement>('.text-body');
+  const content = node.querySelector<HTMLElement>('.text-content');
+  if (!body || !content || !node.isConnected) return null;
+  const boxW = node.offsetWidth;
+  const boxH = node.offsetHeight;
+  const bodyStyle = getComputedStyle(body);
+  const chromeX = boxW - content.offsetWidth;
+  const chromeY = (boxH - body.clientHeight)
+    + parseFloat(bodyStyle.paddingTop) + parseFloat(bodyStyle.paddingBottom);
+  const width = content.style.width;
+  content.style.width = 'max-content';
+  const rect = content.getBoundingClientRect();
+  const layoutW = content.offsetWidth;
+  const layoutH = content.offsetHeight;
+  const scale = node.getBoundingClientRect().width / (boxW || 1);
+  content.style.width = width;
+  // Bounding rects are in screen pixels (the canvas is zoomed) but keep the
+  // fraction offsetWidth rounds away; the box is in canvas pixels. Rotation
+  // skews that ratio, so a rotated box settles for the rounded layout size.
+  const unscaled = !el.rot && scale > 0 ? scale : null;
+  const naturalW = unscaled ? rect.width / unscaled : layoutW + 1;
+  const naturalH = unscaled ? rect.height / unscaled : layoutH;
+  if (naturalH < 1) return null;
+  const w = Math.max(8, Math.ceil(naturalW + chromeX));
+  const h = Math.max(8, Math.ceil(naturalH + chromeY));
+  if (Math.abs(w - el.w) <= 1 && Math.abs(h - el.h) <= 1) return null;
+  const x = el.align === 'center' ? Math.round(el.x + (el.w - w) / 2)
+    : el.align === 'right' ? el.x + el.w - w
+      : el.x;
+  return { x, w, h };
+}
+
+/**
+ * Whether a pointer move is a hover: a mouse or pen reporting no button held.
+ *
+ * A press starts a drag, and only moves made with the button still down may
+ * carry it on. The window system can deliver a move for a pointer that is not
+ * pressing at all — on CI's window-manager-less X display a hover at the
+ * window's centre arrives whenever a window maps, and a button released where
+ * the page never hears of it leaves the next hover in the same state.
+ * Treating those as the drag moved
+ * the pressed object to wherever that pointer happened to be, so a click on a
+ * selected box flung it across the slide (test/pointerDragBugs.test.ts).
+ *
+ * Touch never reports a hover while it is down, and a pointer type the
+ * browser did not set is not a device that can say either way.
+ */
+export function isHoverMove(ev: PointerEvent): boolean {
+  return ev.buttons === 0 && (ev.pointerType === 'mouse' || ev.pointerType === 'pen');
+}
+
 /** Whether a point is inside the visible crop window of a media element. */
 function mediaMaskContainsPoint(
   el: Extract<SlideElement, { type: 'image' | 'video' }>,
@@ -6737,8 +7645,13 @@ function distanceToSegment(
   return Math.hypot(point.x - (start.x + t * vx), point.y - (start.y + t * vy));
 }
 
+/** Shapes edited by their two endpoints rather than a resize box. */
+export function hasEndpoints(el: SlideElement): boolean {
+  return el.type === 'shape' && (el.shape === 'line' || el.shape === 'arrow' || el.shape === 'brace');
+}
+
 /**
- * The two endpoints of a line/arrow element in canvas coordinates. The shape
+ * The two endpoints of a line/arrow/brace element in canvas coordinates. The shape
  * renders from the box's left-centre to right-centre, rotated about the
  * box centre — so endpoints are derived, not stored.
  */
@@ -6807,27 +7720,87 @@ function intersects(a: Rect, b: Rect): boolean {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
-/**
- * Force a resize back onto the original aspect ratio, keeping the anchor corner
- * (the one opposite the handle) fixed.
- */
-function constrainAspect(
-  rect: Rect,
-  origin: Rect,
-  edges: { left: boolean; right: boolean; top: boolean; bottom: boolean },
-  aspect: number,
-): Rect {
-  const out = { ...rect };
-  // Drive from whichever dimension the handle changed more, so the box tracks
-  // the cursor rather than snapping to one axis.
-  const dw = Math.abs(rect.w - origin.w);
-  const dh = Math.abs(rect.h - origin.h);
-  if (dw >= dh) out.h = out.w / aspect;
-  else out.w = out.h * aspect;
+type Edges = { left: boolean; right: boolean; top: boolean; bottom: boolean };
 
+/** Keep `rect` at its size but put it back against the anchor (opposite) edges. */
+function anchored(rect: Rect, origin: Rect, edges: Edges): Rect {
+  const out = { ...rect };
   if (edges.left) out.x = origin.x + origin.w - out.w;
   if (edges.top) out.y = origin.y + origin.h - out.h;
   return out;
+}
+
+/**
+ * A free resize, held at the minimum size on every axis the handle moves. A
+ * pointer dragged past the opposite edge leaves the box at its smallest
+ * rather than turning it inside out.
+ */
+function clampResize(rect: Rect, origin: Rect, edges: Edges): Rect {
+  const out = { ...rect };
+  if ((edges.left || edges.right) && out.w < MIN_RESIZE) out.w = Math.min(MIN_RESIZE, origin.w);
+  if ((edges.top || edges.bottom) && out.h < MIN_RESIZE) out.h = Math.min(MIN_RESIZE, origin.h);
+  return anchored(out, origin, edges);
+}
+
+/**
+ * Put a resize back on the original proportions, anchored at the edges
+ * opposite the handle. `rect` is the box a free resize would have made — the
+ * pointer is on its moving edges — and the result is the smallest box in
+ * proportion that still reaches the pointer: the larger of the two scales, so
+ * the pointer always sits on the box's boundary, never outside it. Dragging a
+ * corner past the anchor on either axis is a box of negative size; that holds
+ * the box at its minimum. `drive` scales from one axis's size instead (a snap
+ * that has just set it).
+ */
+function constrainAspect(rect: Rect, origin: Rect, edges: Edges, drive?: 'x' | 'y'): Rect {
+  const sx = rect.w / origin.w;
+  const sy = rect.h / origin.h;
+  const movesX = edges.left || edges.right;
+  const movesY = edges.top || edges.bottom;
+  let scale: number;
+  if (drive) scale = drive === 'x' ? sx : sy;
+  else if (movesX && movesY) scale = Math.min(sx, sy) <= 0 ? 0 : Math.max(sx, sy);
+  else scale = movesX ? sx : sy;
+  scale = Math.max(scale, Math.min(1, MIN_RESIZE / Math.min(origin.w, origin.h)));
+  return anchored({ ...rect, w: origin.w * scale, h: origin.h * scale }, origin, edges);
+}
+
+/**
+ * Snap a keep-aspect resize. Snapping one edge on its own would break the
+ * ratio, and re-imposing the ratio from the other axis would throw the snap
+ * away while its guide stayed up. So each moving axis is snapped on its own
+ * and the whole box is scaled to that axis's snap. A snap may pull the box
+ * off the pointer by no more than the snap distance: the pointer rides the
+ * leading edge (the one `constrainAspect` scaled from), so a snap on the other
+ * axis counts by how far it moves the leading edge — on a wide picture a few
+ * pixels of height are many of width. The candidate that moves it least wins.
+ */
+function snapAspectResize(
+  rect: Rect,
+  pointerRect: Rect,
+  origin: Rect,
+  edges: Edges,
+  canvas: { w: number; h: number },
+  others: Rect[],
+  threshold: number,
+): { rect: Rect; guides: SnapLine[] } {
+  const lead: 'x' | 'y' = Math.abs(rect.w - pointerRect.w) <= Math.abs(rect.h - pointerRect.h) ? 'x' : 'y';
+  let best: { rect: Rect; guides: SnapLine[]; cost: number } | null = null;
+  for (const axis of ['x', 'y'] as const) {
+    const moving = axis === 'x' ? edges.left || edges.right : edges.top || edges.bottom;
+    if (!moving) continue;
+    const only = axis === 'x'
+      ? { ...edges, top: false, bottom: false }
+      : { ...edges, left: false, right: false };
+    const { rect: snapped, guides } = snapResize(rect, only, canvas, others, threshold, MIN_RESIZE);
+    const next = constrainAspect(snapped, origin, edges, axis);
+    const cost = lead === 'x' ? Math.abs(next.w - rect.w) : Math.abs(next.h - rect.h);
+    // Neither an alignment nor a size match: this axis has nothing to offer.
+    if (guides.length === 0 && (axis === 'x' ? snapped.w === rect.w : snapped.h === rect.h)) continue;
+    if (cost > threshold || (best && best.cost <= cost)) continue;
+    best = { rect: next, guides, cost };
+  }
+  return best ?? { rect, guides: [] };
 }
 
 /**

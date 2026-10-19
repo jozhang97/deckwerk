@@ -1,5 +1,7 @@
 import type { ShapeEl, TextEl } from '@shared/deck.js';
 import { makeId } from '@shared/geometry.js';
+import { DEFAULT_BRACE_DEPTH } from '@shared/brace.js';
+import { presetPath, type PolygonPreset } from '@shared/polygonShape.js';
 import { applyTableColumnWidths } from '@shared/paragraphs.js';
 import { newObjectColors } from '@shared/themes.js';
 import type { EditorStore } from './store.js';
@@ -14,12 +16,12 @@ export function insertText(store: EditorStore): TextEl {
   const created: TextEl = {
     type: 'text', id: makeId('text'),
     x: Math.round(deck.canvas.w * 0.1), y: Math.round(deck.canvas.h * 0.4),
-    w: Math.round(deck.canvas.w * 0.8), h: 160, rot: 0, z: nextZ(store),
-    opacity: 1, class: ['placeholder'], style: {}, html: 'New text', align: 'left', valign: 'middle',
-    // On by default: a box that silently spills its text past its own edges is
-    // never what someone typing into it wants. Auto-fit only ever shrinks, so
-    // the authored size still holds for text that already fits.
-    autoFit: true,
+    w: 400, h: 80, rot: 0, z: nextZ(store),
+    opacity: 1, class: ['placeholder'], style: {}, html: 'New text', align: 'center', valign: 'top',
+    // A box from the toolbar is usually a label — slides already come with a
+    // body box for prose — so it hugs its text and the canvas measures it to
+    // size. Dragging a handle turns it into an ordinary wrapping box.
+    autoSize: true,
   };
   store.commit((d) => d.slides[store.get().slideIndex].elements.push(created));
   store.select([created.id]);
@@ -76,10 +78,35 @@ export function insertShape(store: EditorStore, kind: 'rect' | 'ellipse'): Shape
   return created;
 }
 
-/** Insert a native line or arrow and select it. */
+/**
+ * Insert a straight-sided shape — a trapezoid, a parallelogram, a free
+ * four-cornered shape — and select it. It is a path shape whose corners the
+ * canvas offers as handles (see `polygonShape.ts`), so any of them becomes
+ * any quadrilateral by dragging a corner.
+ */
+export function insertPolygon(store: EditorStore, preset: PolygonPreset): ShapeEl {
+  const { deck } = store.get();
+  const { fill } = newObjectColors(deck);
+  const w = 400;
+  const h = 240;
+  const created: ShapeEl = {
+    type: 'shape', id: makeId('shape'),
+    x: Math.round(deck.canvas.w * 0.4), y: Math.round(deck.canvas.h * 0.4),
+    w, h, rot: 0, z: nextZ(store), opacity: 1, class: [], style: {},
+    shape: 'path', fill, stroke: null, strokeWidth: 2, radius: 0,
+    path: presetPath(preset, w, h), pathSize: { w, h }, arrowStart: false, arrowEnd: false,
+  };
+  store.commit((d) => d.slides[store.get().slideIndex].elements.push(created), {
+    label: `Insert ${preset}`,
+  });
+  store.select([created.id]);
+  return created;
+}
+
+/** Insert a native line, arrow or curly brace and select it. */
 export function insertLine(
   store: EditorStore,
-  kind: 'line' | 'arrow',
+  kind: 'line' | 'arrow' | 'brace',
   curved = false,
 ): ShapeEl {
   const { deck } = store.get();
@@ -94,13 +121,14 @@ export function insertLine(
     control: curved
       ? { x: Math.round(deck.canvas.w * 0.35) + 210, y: Math.round(deck.canvas.h * 0.5) - 140 }
       : null,
+    ...(kind === 'brace' ? { braceDepth: DEFAULT_BRACE_DEPTH } : {}),
   };
   store.commit((d) => d.slides[store.get().slideIndex].elements.push(created));
   store.select([created.id]);
   return created;
 }
 
-type ShapeKind = 'rect' | 'ellipse' | 'line' | 'arrow' | 'curved-arrow';
+type ShapeKind = 'rect' | 'ellipse' | PolygonPreset | 'line' | 'arrow' | 'curved-arrow' | 'brace';
 
 function shapeIcon(paths: string): string {
   return (
@@ -115,12 +143,20 @@ const SHAPE_OPTIONS: Array<{ kind: ShapeKind; label: string; icon: string }> = [
     icon: shapeIcon('<rect x="2" y="3.5" width="12" height="9" rx="1.5"/>') },
   { kind: 'ellipse', label: 'Ellipse',
     icon: shapeIcon('<ellipse cx="8" cy="8" rx="6" ry="4.5"/>') },
+  { kind: 'trapezoid', label: 'Trapezoid',
+    icon: shapeIcon('<path d="M5 3.5h6l3 9H2z"/>') },
+  { kind: 'parallelogram', label: 'Parallelogram',
+    icon: shapeIcon('<path d="M5.5 3.5H14l-3.5 9H2z"/>') },
+  { kind: 'quadrilateral', label: 'Four-sided shape',
+    icon: shapeIcon('<path d="M3 3.8 13.5 3l-1.2 9.5L2 10.8z"/>') },
   { kind: 'line', label: 'Line',
     icon: shapeIcon('<path d="M2.5 13.5 13.5 2.5"/>') },
   { kind: 'arrow', label: 'Arrow',
     icon: shapeIcon('<path d="M2.5 13.5 13.5 2.5M7.5 2.5h6v6"/>') },
   { kind: 'curved-arrow', label: 'Curved arrow',
     icon: shapeIcon('<path d="M2.5 13.5C3 7 7 3 13.5 2.7M8.6 2.5l5-.2.2 5"/>') },
+  { kind: 'brace', label: 'Curly brace',
+    icon: shapeIcon('<path d="M1.5 5a2 2 0 0 0 2 2h2.5a2 2 0 0 1 2 2 2 2 0 0 1 2-2h2.5a2 2 0 0 0 2-2"/>') },
 ];
 
 /** Shape menu: a custom dropdown so each option carries an icon. */
@@ -177,8 +213,9 @@ export function createShapeInsertPicker(store: EditorStore): HTMLElement {
         item.blur();
         trigger.blur();
         if (kind === 'curved-arrow') insertLine(store, 'arrow', true);
-        else if (kind === 'line' || kind === 'arrow') insertLine(store, kind);
-        else insertShape(store, kind);
+        else if (kind === 'line' || kind === 'arrow' || kind === 'brace') insertLine(store, kind);
+        else if (kind === 'rect' || kind === 'ellipse') insertShape(store, kind);
+        else insertPolygon(store, kind);
       });
       menu.appendChild(item);
     }

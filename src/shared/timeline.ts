@@ -32,6 +32,54 @@ export function isParagraphBuild(entry: TimelineEntry, slide: Slide): boolean {
   );
 }
 
+/** How long a drawn-in line takes when its entry does not say. */
+export const DEFAULT_DRAW_DURATION = 600;
+/** How long a dissolve takes when its entry does not say (Keynote's default too). */
+export const DEFAULT_DISSOLVE_DURATION = 1000;
+/** How long a blur takes when its entry does not say. */
+export const DEFAULT_BLUR_DURATION = 1000;
+
+/**
+ * The animated forms an `appear` or a `disappear` can take. `dissolve` fades
+ * any element in or out; `blur` fades it in out of a blur (or out into one);
+ * `draw` draws a line or arrow in from its start.
+ */
+export type BuildEffect = 'draw' | 'dissolve' | 'blur';
+
+/** The effect an entry animates with, or null for an instant change. */
+export function buildEffect(entry: TimelineEntry, slide: Slide): BuildEffect | null {
+  const { type, value } = entry.action;
+  if ((value === 'dissolve' || value === 'blur') && (type === 'appear' || type === 'disappear')) {
+    return value;
+  }
+  if (isDrawBuild(entry, slide)) return 'draw';
+  return null;
+}
+
+/** Milliseconds an animated build takes. */
+export function effectDuration(entry: TimelineEntry, effect: BuildEffect): number {
+  return entry.action.duration
+    ?? (effect === 'draw' ? DEFAULT_DRAW_DURATION
+      : effect === 'blur' ? DEFAULT_BLUR_DURATION : DEFAULT_DISSOLVE_DURATION);
+}
+
+/**
+ * An `appear` marked `draw` on a shape draws it in the way a pen would, as
+ * Keynote's Line Draw does: a line or arrow from its start to its end, and a
+ * rectangle, ellipse or drawn path along its outline, its fill following once
+ * the outline is complete. Anything else so marked is an ordinary appear:
+ * text and pictures have no stroke to follow.
+ */
+export function isDrawBuild(entry: TimelineEntry, slide: Slide): boolean {
+  if (entry.action.type !== 'appear' || entry.action.value !== 'draw') return false;
+  return findElement(slide, entry.action.target)?.type === 'shape';
+}
+
+/** Milliseconds a draw build takes. */
+export function drawDuration(entry: TimelineEntry): number {
+  return effectDuration(entry, 'draw');
+}
+
 /**
  * The timeline with by-paragraph entries fanned out into one unit per
  * paragraph, in document order — paragraphs cannot be reordered or split
@@ -109,7 +157,7 @@ export interface SlideState {
   visible: Set<string>;
   /** Ids of video elements that should be playing. */
   playing: Set<string>;
-  /** Extra CSS classes applied by `addClass`/`removeClass` actions. */
+  /** Each element's classes at this step: its authored `class`, then `addClass`/`removeClass` on top. */
   classes: Map<string, Set<string>>;
   /** Seek positions in seconds requested by `seek` actions. */
   seeks: Map<string, number>;
@@ -136,7 +184,8 @@ export function resolveState(slide: Slide, step: number): SlideState {
         .filter((e) => e.type === 'video' && e.autoplay && !hidden.has(e.id))
         .map((e) => e.id),
     ),
-    classes: new Map(),
+    // Seeded with the authored classes so `removeClass` can take one away.
+    classes: new Map(slide.elements.map((e) => [e.id, new Set(e.class)])),
     seeks: new Map(),
     // Seeding every by-paragraph target at zero tells the renderers which
     // elements need per-paragraph reconciliation even before their first step.

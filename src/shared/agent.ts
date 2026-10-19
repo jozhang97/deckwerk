@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  CommentSchema,
   DeckSchema,
   ElementSchema,
   SlideSchema,
@@ -9,6 +10,8 @@ import {
   type SlideElement,
 } from './deck.js';
 import { renameRetiredFields } from './fieldAliases.js';
+import { contentOf, keepComments, keepSlideComments, mergeComments, setComments } from './comments.js';
+import { braceDepthOf } from './brace.js';
 
 export const AGENT_PROTOCOL_VERSION = 1 as const;
 
@@ -48,6 +51,7 @@ export const ComputedElementSceneSchema = z.object({
     arrowStart: z.boolean(),
     arrowEnd: z.boolean(),
     control: z.object({ x: z.number(), y: z.number() }).nullable(),
+    braceDepth: z.number().nullable(),
     path: z.string().nullable(),
   }).nullable(),
   morphId: z.string().nullable(),
@@ -110,12 +114,26 @@ const InsertElementsOperation = z.object({
   op: z.literal('insertElements'),
   slideId: z.string(),
   elements: z.array(ElementSchema).min(1),
+  /**
+   * Where in the slide's element array they go: after this element, or first
+   * when null. Omitted, they are appended. Objects of equal `z` paint in array
+   * order, so an undone delete has to come back to its old place, not the end.
+   */
+  afterElementId: z.string().nullable().optional(),
 });
 const ReplaceElementOperation = z.object({
   op: z.literal('replaceElement'),
   slideId: z.string(),
   elementId: z.string(),
   element: ElementSchema,
+  /**
+   * Collaboration: the element's html as it was when this replacement was
+   * made. If the html has moved on since (someone else typed into the same
+   * box), the lenient collab apply merges the two edits three ways instead
+   * of overwriting the other person's text (collabApply.ts, textMerge.ts).
+   * The strict transaction apply ignores it.
+   */
+  baseHtml: z.string().optional(),
 });
 const DeleteElementsOperation = z.object({
   op: z.literal('deleteElements'),
@@ -176,7 +194,23 @@ const SetSlidePropertiesOperation = z.object({
   clear: z.array(z.string()).optional(),
 });
 
+/**
+ * Change the comment threads on a slide (no `elementId`) or on one object.
+ * `base` is the list the change was made from; the apply merges by comment
+ * id against whatever the target holds by then (shared/comments.ts), so
+ * concurrent replies all land. This is the only operation that changes
+ * comments: the content replacements above keep the target's own.
+ */
+const UpdateCommentsOperation = z.object({
+  op: z.literal('updateComments'),
+  slideId: z.string(),
+  elementId: z.string().optional(),
+  base: z.array(CommentSchema).default([]),
+  comments: z.array(CommentSchema),
+});
+
 export const AgentOperationSchema = z.discriminatedUnion('op', [
+  UpdateCommentsOperation,
   InsertSlidesOperation,
   ReplaceSlideOperation,
   DeleteSlideOperation,
@@ -279,7 +313,7 @@ function applyOperation(deck: Deck, operation: AgentOperation): void {
       if (operation.slide.id !== operation.slideId) {
         throw new Error(`Replacement slide id must remain ${operation.slideId}`);
       }
-      deck.slides[at] = structuredClone(operation.slide);
+      deck.slides[at] = keepSlideComments(structuredClone(operation.slide), deck.slides[at]);
       return;
     }
     case 'deleteSlide': {
@@ -297,9 +331,17 @@ function applyOperation(deck: Deck, operation: AgentOperation): void {
       deck.slides.splice(at, 0, slide);
       return;
     }
-    case 'insertElements':
-      requireSlide(deck, operation.slideId).elements.push(...structuredClone(operation.elements));
+    case 'insertElements': {
+      const slide = requireSlide(deck, operation.slideId);
+      const at = operation.afterElementId === undefined
+        ? slide.elements.length
+        : operation.afterElementId === null
+          ? 0
+          : slide.elements.findIndex((element) => element.id === operation.afterElementId) + 1;
+      if (at === 0 && operation.afterElementId) throw new Error(`Unknown element id: ${operation.afterElementId}`);
+      slide.elements.splice(at, 0, ...structuredClone(operation.elements));
       return;
+    }
     case 'replaceElement': {
       const slide = requireSlide(deck, operation.slideId);
       const at = slide.elements.findIndex((element) => element.id === operation.elementId);
@@ -307,7 +349,7 @@ function applyOperation(deck: Deck, operation: AgentOperation): void {
       if (operation.element.id !== operation.elementId) {
         throw new Error(`Replacement element id must remain ${operation.elementId}`);
       }
-      slide.elements[at] = structuredClone(operation.element);
+      slide.elements[at] = keepComments(structuredClone(operation.element), slide.elements[at]);
       return;
     }
     case 'deleteElements': {
@@ -355,13 +397,22 @@ function applyOperation(deck: Deck, operation: AgentOperation): void {
       }
       deck.slides[at] = {
         ...deck.slides[at],
-        ...structuredClone(operation.slide),
+        ...contentOf(structuredClone(operation.slide)),
         elements: deck.slides[at].elements,
       };
       for (const key of operation.clear ?? []) {
-        if (key === 'id' || key === 'elements') continue;
+        if (key === 'id' || key === 'elements' || key === 'comments') continue;
         delete (deck.slides[at] as Record<string, unknown>)[key];
       }
+      return;
+    }
+    case 'updateComments': {
+      const slide = requireSlide(deck, operation.slideId);
+      const target = operation.elementId === undefined
+        ? slide
+        : slide.elements.find((element) => element.id === operation.elementId);
+      if (!target) throw new Error(`Unknown element id: ${operation.elementId}`);
+      setComments(target, mergeComments(target.comments ?? [], operation.base, operation.comments));
       return;
     }
   }
@@ -481,6 +532,7 @@ function authoredElementScene(element: SlideElement, selected: Set<string>): Com
       arrowStart: element.arrowStart,
       arrowEnd: element.arrowEnd,
       control: element.control ?? null,
+      braceDepth: element.shape === 'brace' ? braceDepthOf(element) : null,
       path: element.path,
     } : null,
     morphId: element.morphId ?? null,

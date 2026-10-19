@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { renameRetiredFields } from './fieldAliases.js';
+import { normalizeHtmlLineHeights, normalizeStyleLineHeight } from './lineHeight.js';
 
 /**
  * The deck format. This schema is the single source of truth: `deck.json` is
@@ -61,17 +62,25 @@ const ThemeSelectionSchema = z.object({
 });
 
 /**
- * A comment attached to a slide or an element. Comments live in deck.json so
- * they sync through the same element-level diff/merge as every other edit and
- * survive download/export. `ts` is an ISO-8601 timestamp.
+ * One message in a comment thread on a slide or an element. Comments live in
+ * deck.json so they survive download and export, but they are review state,
+ * not content: they change only through the `updateComments` operation, which
+ * merges by comment id, and undo never touches them (shared/comments.ts).
+ *
+ * A thread is a root comment (no `parentId`) and the replies that name it.
+ * The root's `resolved` is the thread's. `ts` and `edited` are ISO-8601.
  */
 export const CommentSchema = z.object({
   id: Id,
   author: z.string().default(''),
+  /** Who wrote it, on an access-controlled server; decides who may edit it. */
+  login: z.string().optional(),
   text: z.string(),
   ts: z.string(),
+  edited: z.string().optional(),
   resolved: z.boolean().default(false),
-  /** Optional parent comment for a lightweight reply thread. */
+  resolvedBy: z.string().optional(),
+  /** The root comment this replies to. */
   parentId: Id.optional(),
 });
 
@@ -89,8 +98,12 @@ const BaseElement = z.object({
   opacity: z.number().min(0).max(1).default(1),
   /** CSS classes hooking this element up to theme.css. */
   class: z.array(z.string()).default([]),
-  /** Inline style escape hatch, applied after classes. */
-  style: z.record(z.string()).default({}),
+  /**
+   * Inline style escape hatch, applied after classes. A `line-height` is
+   * stored as a ratio of the font size (see lineHeight.ts), so it is
+   * converted here, on every parse, from a length stated beside a px size.
+   */
+  style: z.record(z.string()).default({}).transform(normalizeStyleLineHeight),
   /** Explicit identity shared by elements manually paired for Morph. */
   morphId: z.string().nullable().optional(),
   /** Stable ancestry retained when an object is duplicated, for opt-in Auto-pair. */
@@ -117,16 +130,25 @@ export const MediaEffectSchema = z.discriminatedUnion('type', [
 const TextElement = BaseElement.extend({
   type: z.literal('text'),
   /** Inline HTML. Fonts and sizes are expected to come from theme.css. */
-  html: z.string().default(''),
+  html: z.string().default('').transform(normalizeHtmlLineHeights),
   /**
    * CSS applied directly to the inner text-content node rather than the
    * positioned element wrapper. This is the escape hatch for glyph paint
    * such as gradient text, clipping and text strokes that cannot work through
    * inherited wrapper CSS alone.
    */
-  contentStyle: z.record(z.string()).optional(),
+  contentStyle: z.record(z.string()).optional()
+    .transform((style) => style && normalizeStyleLineHeight(style)),
   /** Shrink text as needed to keep it inside its box; never enlarge past its authored size. */
   autoFit: z.boolean().optional(),
+  /**
+   * The box hugs its text: lines break only where the author wrote a break,
+   * and the editor keeps `w`/`h` at the laid-out size of the text, anchored
+   * at the edge its alignment names (left, centre or right) and at its top.
+   * A label rather than a column of prose. Resizing the box by hand turns it
+   * back into an ordinary wrapping box. Implies no auto-fit.
+   */
+  autoSize: z.boolean().optional(),
   /**
    * A text object whose sole authored child is a table. Keeping the cell HTML
    * in the existing rich-text field preserves editing and formatting, while
@@ -179,6 +201,14 @@ const TextElement = BaseElement.extend({
    */
   overrides: z.array(z.string()).optional(),
 });
+
+/**
+ * The fit media gets when it is put on a slide: 'contain', i.e. "Keep aspect
+ * ratio" on, so a resize keeps the picture's proportions and Shift frees
+ * them. Cropping is free whatever this says (Shift locks it), since a crop
+ * reshapes the window, never the picture.
+ */
+export const NEW_MEDIA_FIT = 'contain' as const;
 
 const ImageElement = BaseElement.extend({
   type: z.literal('image'),
@@ -250,8 +280,18 @@ const VideoElement = BaseElement.extend({
 
 const ShapeElement = BaseElement.extend({
   type: z.literal('shape'),
-  shape: z.enum(['rect', 'ellipse', 'line', 'arrow', 'path']),
+  shape: z.enum(['rect', 'ellipse', 'line', 'arrow', 'path', 'brace']),
   fill: z.string().nullable().default(null),
+  /**
+   * A two-colour gradient: from `fill` to `to`, running in `angle` degrees
+   * counter-clockwise from the right (270 is top to bottom), like the shadow
+   * direction. Absent or null is a flat fill.
+   */
+  fillGradient: z.object({
+    to: z.string(),
+    angle: z.number().default(270),
+    kind: z.enum(['linear', 'radial']).default('linear'),
+  }).nullable().optional(),
   stroke: z.string().nullable().default(null),
   strokeWidth: z.number().min(0).default(2),
   radius: z.number().min(0).default(0),
@@ -268,8 +308,21 @@ const ShapeElement = BaseElement.extend({
     .default(null),
   arrowStart: z.boolean().default(false),
   arrowEnd: z.boolean().default(false),
+  /**
+   * Arrowhead length in the shape's own units (canvas pixels for a line).
+   * Absent means six times the stroke width. A head is never drawn shorter
+   * than the line is wide: at that size the line simply ends in a point.
+   */
+  arrowSize: z.number().positive().optional(),
   /** Absolute canvas-space control point for an editable quadratic curve. */
   control: z.object({ x: z.number(), y: z.number() }).nullable().optional(),
+  /**
+   * For `shape: "brace"`: how far the brace's point stands off the chord
+   * between its two endpoints, in canvas pixels along the element's own +y
+   * (down when unrotated). The sign is which way it points; half the
+   * magnitude is the radius of all four curls. Absent means the default.
+   */
+  braceDepth: z.number().optional(),
 });
 
 /** Escape hatch: arbitrary markup that still drags and resizes like anything else. */
@@ -361,8 +414,16 @@ export const ActionSchema = z.object({
     'removeClass',
   ]),
   target: Id,
-  /** Seconds for `seek`; class name for `addClass`/`removeClass`. */
+  /**
+   * Seconds for `seek`; class name for `addClass`/`removeClass`. On `appear`,
+   * `"byParagraph"` reveals text a paragraph at a time and `"draw"` draws a
+   * line or arrow in from its start to its end. On `appear` or `disappear`,
+   * `"dissolve"` fades the element in or out and `"blur"` brings it into (or
+   * takes it out of) focus as it fades.
+   */
   value: z.union([z.number(), z.string()]).nullable().default(null),
+  /** Milliseconds an animated build takes (`"draw"`, `"dissolve"`, `"blur"`). */
+  duration: z.number().min(0).optional(),
 });
 
 export const TimelineEntrySchema = z.object({

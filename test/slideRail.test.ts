@@ -23,6 +23,18 @@ function togglePickRow(row: HTMLElement): void {
   row.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, metaKey: true }));
 }
 
+const confirmation = () => document.querySelector<HTMLElement>('.workflow-dialog[role="alertdialog"]');
+
+/** Let the confirmation's promise settle into the deletion it guards. */
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+/** Answer a multi-slide delete's confirmation the way a person does. */
+async function answerConfirmation(key: 'Enter' | 'Escape'): Promise<void> {
+  expect(confirmation(), 'a multi-slide keyboard delete asks first').not.toBeNull();
+  (document.activeElement as HTMLElement).dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+  await settle();
+}
+
 function mulberry32(seed: number): () => number {
   return () => {
     seed |= 0;
@@ -33,7 +45,7 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-function setup() {
+function setup(readOnly = false) {
   (globalThis as unknown as { window: Window }).window.api = {
     assetUrl: (src: string) => src,
   } as never;
@@ -48,7 +60,7 @@ function setup() {
   const store = new EditorStore(deck, '/tmp/deck');
   const host = document.createElement('div');
   document.body.replaceChildren(host);
-  const rail = new SlideRail(host, store);
+  const rail = new SlideRail(host, store, { readOnly });
   return { store, host, rail };
 }
 
@@ -73,6 +85,17 @@ describe('slide hierarchy', () => {
     expect(store.slide?.depth).toBe(1);
     store.redo();
     expect(store.slide?.depth ?? 0).toBe(0);
+  });
+
+  it('keeps read-only rail navigation from indenting slides', () => {
+    const { host, store } = setup(true);
+    store.selectSlide(1);
+    const before = JSON.stringify(store.get().deck);
+    const history = store.history().length;
+    expect(tab(host)).toBe(true);
+    expect(tab(host, true)).toBe(true);
+    expect(JSON.stringify(store.get().deck)).toBe(before);
+    expect(store.history()).toHaveLength(history);
   });
 
   it('refuses indentation without a parent and adds no empty undo entries', () => {
@@ -432,7 +455,7 @@ describe('deleting slides from the rail', () => {
       }
     }, { history: false });
 
-  it('deletes every slide in a Shift-click range as one undo entry', () => {
+  it('deletes every slide in a Shift-click range as one undo entry', async () => {
     const { store, host } = setup();
     push(store, 'slide-3', 'slide-4', 'slide-5');
 
@@ -443,6 +466,8 @@ describe('deleting slides from the rail', () => {
 
     host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
 
+    await answerConfirmation('Enter');
+
     expect(store.get().deck.slides.map((slide) => slide.id)).toEqual(['slide-1', 'slide-5']);
     expect(store.history()[0].label).toBe('Delete 3 slides');
     // The cursor lands just before the range that was removed.
@@ -450,6 +475,67 @@ describe('deleting slides from the rail', () => {
 
     store.undo();
     expect(store.get().deck.slides).toHaveLength(5);
+  });
+
+  it('asks before a keyboard delete of several slides; Escape keeps them and refocuses the rail', async () => {
+    const { store, host, rail } = setup();
+    push(store, 'slide-3', 'slide-4');
+    const messages: string[] = [];
+    rail.onStatus = (message) => messages.push(message);
+    const items = () => host.querySelectorAll<HTMLElement>('.rail-item');
+    pickRow(items()[1]);
+    pickRow(items()[2], true);
+
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+    await settle();
+    expect(store.get().deck.slides).toHaveLength(4);
+    expect(confirmation()!.querySelector('h2')!.textContent).toBe('Delete 2 slides?');
+    expect(confirmation()!.textContent).toContain('Slides 2–3 are selected.');
+    expect(document.activeElement?.textContent).toBe('Delete 2 slides');
+    expect(document.activeElement?.className).toBe('danger');
+    // A repeated key reaches the dialog, not the rail behind it.
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+    await settle();
+    expect(document.querySelectorAll('.workflow-dialog')).toHaveLength(1);
+
+    await answerConfirmation('Escape');
+    expect(confirmation()).toBeNull();
+    expect(store.get().deck.slides).toHaveLength(4);
+    expect(document.activeElement).toBe(host);
+    expect(messages).toEqual([]);
+
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));
+    await answerConfirmation('Enter');
+    expect(store.get().deck.slides.map((slide) => slide.id)).toEqual(['slide-1', 'slide-4']);
+    expect(document.activeElement).toBe(host);
+    expect(messages.at(-1)).toMatch(/^Deleted slides 2–3\. Undo \((?:⌘Z|Ctrl\+Z)\) restores them\.$/);
+  });
+
+  it('cancels when Return lands on the Cancel button', async () => {
+    const { store, host } = setup();
+    push(store, 'slide-3');
+    pickRow(host.querySelectorAll<HTMLElement>('.rail-item')[0]);
+    pickRow(host.querySelectorAll<HTMLElement>('.rail-item')[1], true);
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+    const cancel = [...confirmation()!.querySelectorAll('button')].find((button) => button.textContent === 'Cancel')!;
+    cancel.focus();
+    cancel.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await settle();
+    expect(confirmation()).toBeNull();
+    expect(store.get().deck.slides).toHaveLength(3);
+  });
+
+  it('deletes the menu\'s explicit selection at once and reports it', () => {
+    const { store, host, rail } = setup();
+    push(store, 'slide-3');
+    const messages: string[] = [];
+    rail.onStatus = (message) => messages.push(message);
+    pickRow(host.querySelectorAll<HTMLElement>('.rail-item')[0]);
+    pickRow(host.querySelectorAll<HTMLElement>('.rail-item')[1], true);
+    rail.deleteSlide();
+    expect(confirmation()).toBeNull();
+    expect(store.get().deck.slides.map((slide) => slide.id)).toEqual(['slide-3']);
+    expect(messages).toEqual([expect.stringMatching(/^Deleted slides 1–2\. Undo/)]);
   });
 
   it('takes focus when a slide is clicked, so Backspace is a slide command', () => {
@@ -460,16 +546,21 @@ describe('deleting slides from the rail', () => {
   });
 
   it('deletes only the current slide when just one is selected', () => {
-    const { store, host } = setup();
+    const { store, host, rail } = setup();
     push(store, 'slide-3');
+    const messages: string[] = [];
+    rail.onStatus = (message) => messages.push(message);
     pickRow(host.querySelectorAll<HTMLElement>('.rail-item')[1]);
     host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
 
+    // One slide goes at once: no confirmation.
+    expect(confirmation()).toBeNull();
     expect(store.get().deck.slides.map((slide) => slide.id)).toEqual(['slide-1', 'slide-3']);
     expect(store.history()[0].label).toBe('Delete slide');
+    expect(messages).toEqual([expect.stringMatching(/^Deleted slide 2\. Undo \((?:⌘Z|Ctrl\+Z)\) restores it\.$/)]);
   });
 
-  it('deletes a scattered Cmd-click selection in one keystroke', () => {
+  it('deletes a scattered Cmd-click selection in one keystroke', async () => {
     const { store, host } = setup();
     push(store, 'slide-3', 'slide-4', 'slide-5');
 
@@ -481,6 +572,8 @@ describe('deleting slides from the rail', () => {
 
     host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
 
+    await answerConfirmation('Enter');
+
     expect(store.get().deck.slides.map((slide) => slide.id)).toEqual(['slide-2', 'slide-4']);
     expect(store.history()[0].label).toBe('Delete 3 slides');
 
@@ -488,7 +581,7 @@ describe('deleting slides from the rail', () => {
     expect(store.get().deck.slides).toHaveLength(5);
   });
 
-  it('drops a Cmd-clicked slide back out of the selection', () => {
+  it('drops a Cmd-clicked slide back out of the selection', async () => {
     const { store, host } = setup();
     push(store, 'slide-3');
 
@@ -500,6 +593,8 @@ describe('deleting slides from the rail', () => {
     expect([...store.get().slideSelection]).toEqual(['slide-1', 'slide-3']);
 
     host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+
+    await answerConfirmation('Enter');
     expect(store.get().deck.slides.map((slide) => slide.id)).toEqual(['slide-2']);
   });
 
@@ -513,13 +608,15 @@ describe('deleting slides from the rail', () => {
     expect(store.get().slideIndex).toBe(1);
   });
 
-  it('leaves one fresh slide behind when the selection covers the deck', () => {
+  it('leaves one fresh slide behind when the selection covers the deck', async () => {
     const { store, host } = setup();
     const items = () => host.querySelectorAll<HTMLElement>('.rail-item');
     pickRow(items()[0]);
     pickRow(items()[1], true);
 
     host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+
+    await answerConfirmation('Enter');
 
     const slides = store.get().deck.slides;
     expect(slides).toHaveLength(1);
@@ -544,7 +641,7 @@ describe('deleting slides from the rail', () => {
     expect(store.get().deck.slides.map((slide) => slide.id)).toEqual(['slide-1']);
   });
 
-  it('selects and deletes a large collapsed hidden suffix without expanding it', () => {
+  it('selects and deletes a large collapsed hidden suffix without expanding it', async () => {
     const deck = emptyDeck('Imported deck with hidden appendix');
     deck.slides = Array.from({ length: 215 }, (_, index) => ({
       id: `slide-${index + 1}`,
@@ -576,12 +673,14 @@ describe('deleting slides from the rail', () => {
 
     host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));
 
+    await answerConfirmation('Enter');
+
     expect(store.get().deck.slides).toHaveLength(181);
     expect(store.get().deck.slides.at(-1)?.id).toBe('slide-181');
     expect(store.history()[0].label).toBe('Delete 34 slides');
   });
 
-  it('fuzzes collapsed hidden suffix selection, deletion, and undo', () => {
+  it('fuzzes collapsed hidden suffix selection, deletion, and undo', async () => {
     const random = mulberry32(2608182);
     for (let attempt = 0; attempt < 24; attempt += 1) {
       const slideCount = 3 + Math.floor(random() * 68);
@@ -611,6 +710,8 @@ describe('deleting slides from the rail', () => {
       expect(host.querySelector('.rail-run'), `attempt ${attempt}: stayed collapsed`).toBeNull();
 
       host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }));
+
+      await answerConfirmation('Enter');
       expect(
         store.get().deck.slides.map((slide) => slide.id),
         `attempt ${attempt}: surviving prefix`,
@@ -1105,5 +1206,51 @@ describe('a drag that reorders nothing', () => {
     drag(first, 'dragend');
 
     expect(host.querySelectorAll('.drop-before, .drop-after')).toHaveLength(0);
+  });
+});
+
+describe('changing layout from the slide context menu', () => {
+  beforeEach(() => document.body.replaceChildren());
+
+  const openMenu = (row: HTMLElement) => {
+    row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    return document.getElementById('ctx-menu')!;
+  };
+  const layoutRow = (menu: HTMLElement, label: string) =>
+    [...menu.querySelectorAll<HTMLButtonElement>('button.ctx-check')]
+      .find((row) => row.textContent === label)!;
+
+  it('lists every layout, ticks the current one, and applies a pick as one undo step', () => {
+    const { store, host } = setup();
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(store.slide?.layout).toBe('standard');
+    const menu = openMenu(host.querySelectorAll<HTMLElement>('.rail-item')[1]);
+
+    expect(menu.querySelector('.ctx-heading')?.textContent).toBe('Layout');
+    expect([...menu.querySelectorAll('button.ctx-check')].map((row) => row.textContent))
+      .toEqual(['Freeform', 'Title + body', 'Title slide']);
+    expect(layoutRow(menu, 'Title + body').getAttribute('aria-checked')).toBe('true');
+    expect(layoutRow(menu, 'Title slide').getAttribute('aria-checked')).toBe('false');
+
+    layoutRow(menu, 'Title slide').click();
+    expect(document.getElementById('ctx-menu')).toBeNull();
+    expect(store.slide?.layout).toBe('title');
+    expect(store.get().deck.slides[0].layout ?? 'freeform').toBe('freeform');
+
+    store.undo();
+    expect(store.slide?.layout).toBe('standard');
+  });
+
+  it('applies the layout to every selected slide and ticks nothing for a mixed set', () => {
+    const { store, host } = setup();
+    store.commit((deck) => applySlideLayout(deck.slides[1], 'standard'));
+    const rows = () => host.querySelectorAll<HTMLElement>('.rail-item');
+    pickRow(rows()[0]);
+    pickRow(rows()[1], true);
+    const menu = openMenu(rows()[1]);
+    expect(menu.querySelectorAll('button.ctx-check[aria-checked="true"]')).toHaveLength(0);
+
+    layoutRow(menu, 'Title slide').click();
+    expect(store.get().deck.slides.map((slide) => slide.layout)).toEqual(['title', 'title']);
   });
 });

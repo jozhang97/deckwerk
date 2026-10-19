@@ -87,7 +87,7 @@ exports. See [PyMOL sessions](docs/pymol.md) for usage and compatibility details
 
 ### Native agent integration
 
-DeckWerk is designed so that AI agents can create and edit presentations directly. It does not run or own an agent account: for a local presentation, the **Agent…** button gives you its real deck folder and no server is involved. In a browser collaboration session, the same button gives you one command that mirrors the remote live deck folder onto your machine and keeps it in sync. Only Node is needed for that remote bridge.
+DeckWerk is designed so that AI agents can create and edit presentations directly. It does not run or own an agent account: for a local presentation, the **Agent…** button gives you its real deck folder and no server is involved. In a browser collaboration session, the same button copies a prompt that tells your agent how to mirror the remote live deck folder onto your machine and keep it in sync; the agent sets the mirror up itself. Only Node is needed for that remote bridge.
 
 In both cases the authoring loop is the same: run `slide-agent context`, export or create an HTML file under `edit/`, then edit and save it. DeckWerk compiles that HTML into ordinary editable slide objects, applies the save as one named undoable change, and shows it in History. JavaScript-driven content is explicitly staged as a web element; titles, captions, and other non-interactive content remain normal editable objects.
 
@@ -149,9 +149,9 @@ no passwords: tailnet membership is the authentication. Never expose this setup
 through `tailscale funnel`.
 
 **Agents.** Every collaborator can bring their own agent, such as Claude Code or
-Codex. **Agent…** in the browser toolbar gives a one-line command that needs
-only Node 22. It mirrors the live presentation into a folder on their machine
-and starts their agent there. The agent's edits reach everyone within a second
+Codex. **Agent…** in the browser toolbar copies a prompt to paste into the
+agent. The agent then starts a small bridge (it needs only Node 22) that
+mirrors the live presentation into a folder on their machine. The agent's edits reach everyone within a second
 or two and show up under its name in History. Nothing runs on the server on
 anyone's behalf. `--no-local-agents` turns this off.
 
@@ -169,7 +169,7 @@ DeckWerk is particularly suited to:
 
 DeckWerk presentations are stored locally as folders containing the presentation and its media. Videos remain ordinary video files and images remain ordinary image files.
 
-Drag a PDF onto a slide to insert its first page as a resizable figure. DeckWerk converts it to SVG, preserving vector artwork and font outlines, and keeps the original PDF in the deck's assets. The figure uses the same crop, border, presentation, and export controls as other images. In a development checkout, run `npm run setup:importer` once to install the converter dependencies.
+Drag a PDF onto a slide to insert its first page as a resizable figure. DeckWerk converts it to SVG, preserving vector artwork and font outlines, and keeps the original PDF in the deck's assets. The figure uses the same crop, border, presentation, and export controls as other images. In a development checkout, run `npm run setup:importers` once to install the converter dependencies.
 
 Organize the slide list into a hierarchy by selecting thumbnails and pressing Tab to indent or Shift+Tab to outdent. Indenting a parent or dragging it to a new position carries its nested slides. The hierarchy is saved with the deck and supports undo/redo; indentation does not change presentation order.
 

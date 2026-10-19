@@ -6,11 +6,13 @@ import {
   LIST,
   MOD,
   PARA,
+  SHIFT,
   elementSelector,
   startCrossSession,
   type CrossSession,
   type CrossState,
 } from './support/crossContextSession.js';
+import { sidebarSelectionProbes } from './support/selectionSession.js';
 
 /**
  * Cross-context fuzz: a seeded random walk over a slide holding THREE
@@ -22,7 +24,10 @@ import {
  * mid-typing, Escape and empty-canvas clicks mid-edit, shift-click
  * multi-select, marquee drags, rail hops mid-edit, double-clicking the image,
  * Cmd+B mid-word, undo/redo at random points, Backspace with an element
- * selection, and Cmd+A in both contexts.
+ * selection, Cmd+A in both contexts, Backspace on a multi-slide rail
+ * selection (which must ask first; cancelled, or confirmed and undone), and
+ * resizing a selected word from the sidebar's Font size field, and
+ * panning and zooming the view with a plain mouse and the keyboard.
  *
  * After EVERY step five oracles run: the whole-editor invariant set from
  * selectionSession, keystroke routing via per-step nonce strings, an element
@@ -67,6 +72,14 @@ function random(seed: number): () => number {
     return (state - 1) / 2147483646;
   };
 }
+
+/**
+ * Element ids an op legitimately created and then undid within itself — the
+ * blank slide a confirmed whole-deck delete leaves. A later redo, in this walk
+ * or (the walks share one history) a later one, may bring them back, and that
+ * is not undo materialising something new.
+ */
+const producedIds = new Set<string>();
 
 const pick = <T,>(next: () => number, list: T[]): T =>
   list[Math.floor(next() * list.length)];
@@ -137,8 +150,9 @@ function isKnownStaleSlideIdentity(error: string): boolean {
 type OpName =
   | 'click' | 'shift-click' | 'double-click text' | 'double-click image then text'
   | 'type nonce' | 'bold mid-word' | 'escape' | 'click empty' | 'marquee'
-  | 'rail hop' | 'rail indent' | 'rail group' | 'undo' | 'redo' | 'undo round-trip' | 'delete selection'
-  | 'cmd+a' | 'sidebar toggle';
+  | 'rail indent' | 'rail group' | 'sidebar toggle' | 'rail hop' | 'undo' | 'redo' | 'undo round-trip' | 'delete selection'
+  | 'cmd+a' | 'click with stray hover' | 'rail multi-delete' | 'stack key' | 'spelling fix'
+  | 'size from sidebar' | 'viewport gesture';
 
 interface Violation { seed: number; step: number; op: OpName; oracle: string; detail: string }
 
@@ -212,7 +226,7 @@ describe.skipIf(!electronBinary)('cross-context fuzz over three elements and two
           break;
         }
         if (censusMode === 'resync') {
-          const foreign = ids.filter((id) => !everKnown.has(id));
+          const foreign = ids.filter((id) => !everKnown.has(id) && !producedIds.has(id));
           if (foreign.length > 0) {
             flag('census', `undo/redo materialised never-seen elements: [${foreign.join(', ')}]`);
             break;
@@ -417,6 +431,7 @@ function chooseOp(next: () => number, pre: CrossState): OpName {
   if (targets.length > 0) {
     add('click', 3);
     add('shift-click', 2);
+    add('click with stray hover', 1);
     if (targets.some((id) => id !== IMAGE)) add('double-click text', 3);
   }
   if (pre.slideIndex === 0 && pre.elements.includes(IMAGE)
@@ -427,6 +442,8 @@ function chooseOp(next: () => number, pre: CrossState): OpName {
     add('type nonce', 3);
     add('bold mid-word', 2);
     add('click', 2); // click the other box mid-typing, no Escape first
+    add('spelling fix', 1);
+    add('size from sidebar', 2);
   }
   add('escape', 1);
   add('click empty', 1);
@@ -440,6 +457,9 @@ function chooseOp(next: () => number, pre: CrossState): OpName {
   add('undo round-trip', 1);
   if (pre.editing === null && pre.selection.length > 0) add('delete selection', 2);
   add('cmd+a', 1);
+  add('rail multi-delete', 1);
+  add('stack key', 1);
+  add('viewport gesture', 2);
   return pick(next, ops);
 }
 
@@ -470,6 +490,24 @@ async function performOp(
     case 'shift-click':
       await session.shiftClick(pick(next, targets));
       return 'same';
+    case 'click with stray hover': {
+      // A click is not a drag, whatever the window system reports in between:
+      // nothing on the slide may have moved.
+      const where = `(() => {
+        const state = window.store.get();
+        return Object.fromEntries(state.deck.slides[state.slideIndex].elements
+          .map((element) => [element.id, element.x + ',' + element.y]));
+      })()`;
+      const before = await session.cdp.evaluate<Record<string, string>>(where);
+      await session.clickWithStrayHover(pick(next, targets));
+      const after = await session.cdp.evaluate<Record<string, string>>(where);
+      for (const [id, at] of Object.entries(before)) {
+        if (after[id] !== undefined && after[id] !== at) {
+          flag('census', `${id} moved from ${at} to ${after[id]} on a click with a stray hover`);
+        }
+      }
+      return 'same';
+    }
     case 'double-click text':
       await session.doubleClick(pick(next, targets.filter((id) => id !== IMAGE)));
       return 'same';
@@ -495,6 +533,54 @@ async function performOp(
       await wait(120);
       await checkRouting(pre, head, flag);
       await checkRouting(pre, tail, flag);
+      return 'same';
+    }
+    case 'size from sidebar': {
+      // Select a word, resize it from the sidebar's Font size field, and click
+      // back into the text. While the field has focus the edit, the selection
+      // and its paint survive (the browser's own selection moved into the
+      // field, so the editor shows it); back in the text the paint is gone.
+      const editing = pre.editing!;
+      const probes = sidebarSelectionProbes(session.cdp);
+      const length = (await session.textOf(editing)).length;
+      if (length > 0) await probes.selectWord(editing, Math.min(6, length - 1));
+      const selected = await probes.selectedText();
+      await probes.setField('Font size', pick(next, ['36', '44']));
+      const after = await session.state();
+      if (after.editing !== editing) {
+        flag('routing', `sizing from the sidebar ended the edit of ${editing}`
+          + ` (now ${after.editing ?? 'nothing'})`);
+        return 'same';
+      }
+      if (selected) {
+        const still = await probes.selectedText();
+        if (still !== selected) {
+          flag('routing', `sizing from the sidebar changed the selection from`
+            + ` ${JSON.stringify(selected)} to ${JSON.stringify(still)}`);
+        }
+        const painted = await probes.paintedSelection();
+        if (painted.join('') !== selected) {
+          flag('routing', `the selection ${JSON.stringify(selected)} shows as`
+            + ` ${JSON.stringify(painted)} while the Font size field has focus`);
+        }
+      }
+      if (length > 0) {
+        await session.cdp.clickTextAtOffset(`${elementSelector(editing)} .text-content`, 0,
+          `the start of ${editing}`);
+        await wait(80);
+      } else {
+        await session.click(editing);
+      }
+      const back = await session.state();
+      if (back.editing !== editing || back.focus !== `inside ${editing}`) {
+        flag('routing', `clicking back into ${editing} from the sidebar left editing`
+          + ` ${back.editing ?? 'nothing'} with focus ${back.focus}`);
+      }
+      const kept = await probes.keptHighlight();
+      if (kept.length > 0) {
+        flag('routing', `the kept selection ${JSON.stringify(kept)} survived the click back`
+          + ` into ${editing}`);
+      }
       return 'same';
     }
     case 'escape':
@@ -610,9 +696,107 @@ async function performOp(
       const expected = (await session.allElementIds());
       return expected;
     }
+    case 'stack key': {
+      // [ ] restack the selection, but inside a text edit they are text: the
+      // character goes into the box and nothing moves in the stack.
+      const stacking = () => session.cdp.evaluate<string>(`JSON.stringify(window.store.slide.elements.map((e) => [e.id, e.z]))`);
+      const before = await stacking();
+      await session.stackKey(next() < 0.5, next() < 0.5);
+      if (pre.editing !== null) {
+        const after = await stacking();
+        if (after !== before) flag('routing', `a bracket typed into ${pre.editing} restacked the slide: ${before} -> ${after}`);
+      }
+      return 'same';
+    }
     case 'cmd+a':
       await session.chord('a', 'KeyA', 65, MOD, pre.editing !== null ? ['selectAll'] : undefined);
       return 'same';
+    case 'viewport gesture':
+      await viewportGesture(next, pre, flag);
+      return 'same';
+    case 'rail multi-delete': {
+      // Select both slides in the rail with real clicks, then a deletion key.
+      // More than one slide must never go without a confirmation: Escape
+      // keeps everything (and gives the rail its focus back); Return deletes,
+      // and one undo restores exactly what was there.
+      const snapshot = () => session.cdp.evaluate<string>(
+        `JSON.stringify(window.store.get().deck.slides.map((slide) => [slide.id, slide.elements.map((el) => el.id)]))`);
+      const dialogOpen = () => session.cdp.evaluate<boolean>(
+        `Boolean(document.querySelector('.workflow-dialog[role="alertdialog"]'))`);
+      await session.clickRail(pre.slideIndex);
+      await session.cdp.clickModified(`.rail-item[data-index="${pre.slideIndex === 0 ? 1 : 0}"]`,
+        SHIFT, 'shift-click the other rail slide');
+      await wait(120);
+      const before = await snapshot();
+      const selected = await session.cdp.evaluate<number>('window.store.get().slideSelection.size');
+      if (selected < 2) {
+        flag('routing', `shift-clicking the other rail slide selected ${selected} slide(s)`);
+        return 'same';
+      }
+      if (next() < 0.5) await session.key('Backspace', 8);
+      else await session.key('Delete', 46);
+      await wait(150);
+      if (await snapshot() !== before) {
+        flag('census', 'a deletion key on a multi-slide rail selection deleted without asking');
+        return 'resync';
+      }
+      if (!await dialogOpen()) {
+        flag('census', 'a deletion key on a multi-slide rail selection asked nothing');
+        return 'same';
+      }
+      if (next() < 0.7) {
+        await session.key('Escape', 27);
+        await wait(120);
+        if (await dialogOpen()) flag('routing', 'Escape left the slide-delete confirmation open');
+        if (!await session.cdp.evaluate<boolean>(
+          `document.getElementById('rail')?.contains(document.activeElement) === true`)) {
+          flag('routing', 'cancelling the slide-delete confirmation did not return focus to the rail');
+        }
+        if (await snapshot() !== before) flag('census', 'cancelling the confirmation still deleted slides');
+        return 'same';
+      }
+      await session.key('Enter', 13);
+      await wait(250);
+      const slides = await session.cdp.evaluate<number>('window.store.get().deck.slides.length');
+      if (slides !== 1) flag('census', `confirming deletion of the whole deck left ${slides} slides, not one blank slide`);
+      for (const id of await session.allElementIds()) producedIds.add(id);
+      await session.chord('z', 'KeyZ', 90, MOD);
+      await wait(300);
+      if (await snapshot() !== before) {
+        flag('undoRoundTrip', `undo after the confirmed slide deletion did not restore the deck: ${await snapshot()}`);
+      }
+      return 'same';
+    }
+    case 'spelling fix': {
+      // Type a misspelling, wait for Harper's mark, and take the first
+      // suggestion from the right-click menu: a programmatic edit inside the
+      // live session that must land in the box being edited, as its own step.
+      await session.type(' wrold ');
+      let point: { x: number; y: number } | null = null;
+      const deadline = Date.now() + 20_000;
+      while (!point && Date.now() < deadline) {
+        point = await session.cdp.evaluate<{ x: number; y: number } | null>(`(() => {
+          const h = CSS.highlights.get('deckwerk-spelling');
+          const r = h && [...h].find((range) => range.toString() === 'wrold');
+          if (!r) return null;
+          const box = r.getBoundingClientRect();
+          return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+        })()`);
+        if (!point) await wait(100);
+      }
+      if (!point) {
+        flag('routing', 'typed "wrold" while editing but Harper never marked it');
+        return 'same';
+      }
+      await session.cdp.rightClickAt(point.x, point.y);
+      await session.cdp.clickByText('#ctx-menu button', 'world');
+      await wait(120);
+      const texts = await session.allTexts();
+      if (pre.editing && !texts[pre.editing]?.includes('world')) {
+        flag('routing', `the spelling fix did not land in ${pre.editing}: "${texts[pre.editing]}"`);
+      }
+      return 'same';
+    }
   }
 }
 
@@ -640,6 +824,104 @@ async function checkRouting(
     flag('routing', `typed "${nonce}" into ${editing} but it also appears in `
       + `[${strays.join(', ')}]`);
   }
+}
+
+/**
+ * Pan or zoom the view the way a plain mouse and the keyboard do it — a
+ * Ctrl/Cmd wheel notch, Shift and the wheel, a middle-button drag, Space and
+ * a drag, Ctrl/Cmd + or - — over a random object or the empty slide, mid-edit
+ * or not. None of it is an edit: every object stays where it was, and the
+ * selection, the text edit and the slide are as they were. Nor may the page
+ * itself zoom. Ctrl/Cmd+0 then fits the view again, so later ops aim at an
+ * unpanned slide.
+ */
+async function viewportGesture(
+  next: () => number,
+  pre: CrossState,
+  flag: (oracle: 'routing' | 'census', detail: string) => void,
+): Promise<void> {
+  const { cdp } = session;
+  const snapshot = () => cdp.evaluate<string>(`(() => {
+    const state = window.store.get();
+    return JSON.stringify({
+      geometry: state.deck.slides.map((slide) => slide.elements.map((element) =>
+        [element.id, element.x, element.y, element.w, element.h, element.rot])),
+      slide: state.slideIndex,
+      selection: [...state.selection].sort(),
+      editing: window.canvas.editingElementId(),
+    });
+  })()`);
+  const before = await snapshot();
+  const ratio = await cdp.evaluate<number>('window.devicePixelRatio');
+  const targets = targetsOn(pre);
+  const aim = targets.length > 0 && next() < 0.7
+    ? await session.boxOf(elementSelector(pick(next, targets)))
+    : await session.boxOf('.slide-layer');
+  const x = aim.left + aim.width * (0.2 + 0.6 * next());
+  const y = aim.top + aim.height * (0.2 + 0.6 * next());
+  const mouse = (type: string, at: { x: number; y: number }, button: string, buttons: number) =>
+    cdp.call('Input.dispatchMouseEvent', {
+      type, x: at.x, y: at.y, button, buttons, clickCount: type === 'mouseMoved' ? 0 : 1,
+    });
+  const drag = async (button: 'left' | 'middle', buttons: number) => {
+    const dx = (next() - 0.5) * 300;
+    const dy = (next() - 0.5) * 200;
+    await mouse('mouseMoved', { x, y }, 'none', 0);
+    await mouse('mousePressed', { x, y }, button, buttons);
+    for (let i = 1; i <= 4; i++) {
+      await mouse('mouseMoved', { x: x + (dx * i) / 4, y: y + (dy * i) / 4 }, button, buttons);
+      await wait(16);
+    }
+    await mouse('mouseReleased', { x: x + dx, y: y + dy }, button, 0);
+  };
+  // Space pans only from the canvas or from nothing in particular; with the
+  // rail or a field focused, it is theirs, and a Space drag would be a plain
+  // drag. Mid-edit, Space is a typed space.
+  const spaceIsFree = pre.editing === null && await cdp.evaluate<boolean>(`(() => {
+    const focus = document.activeElement;
+    return !focus || focus === document.body || Boolean(focus.closest('#canvas'));
+  })()`);
+  const gestures = ['notch', 'shift wheel', 'middle drag', 'zoom keys', ...(spaceIsFree ? ['space drag'] : [])];
+  const gesture = pick(next, gestures);
+  switch (gesture) {
+    case 'notch':
+      await cdp.call('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x, y, deltaX: 0, deltaY: next() < 0.5 ? -120 : 100, modifiers: MOD,
+      });
+      break;
+    case 'shift wheel':
+      await cdp.call('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x, y, deltaX: 0, deltaY: (next() - 0.5) * 240, modifiers: SHIFT,
+      });
+      break;
+    case 'middle drag':
+      await drag('middle', 4);
+      break;
+    case 'zoom keys':
+      if (next() < 0.5) await session.chord('=', 'Equal', 187, MOD);
+      else await session.chord('-', 'Minus', 189, MOD);
+      break;
+    case 'space drag': {
+      const space = { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32 };
+      await cdp.call('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...space });
+      await cdp.call('Input.dispatchKeyEvent', { type: 'char', text: ' ', unmodifiedText: ' ', ...space });
+      await drag('left', 1);
+      await cdp.call('Input.dispatchKeyEvent', { type: 'keyUp', ...space });
+      break;
+    }
+  }
+  await wait(120);
+  const after = await snapshot();
+  if (after !== before) {
+    flag('census', `${gesture} changed the deck or the editing state; diff: ${firstDiff(before, after)}`);
+  }
+  await session.chord('0', 'Digit0', 48, MOD);
+  const view = await cdp.evaluate<{ zoom: string; ratio: number }>(`({
+    zoom: document.querySelector('#canvas .zoom-value').value,
+    ratio: window.devicePixelRatio,
+  })`);
+  if (view.ratio !== ratio) flag('routing', `${gesture} zoomed the page itself: ${ratio} -> ${view.ratio}`);
+  if (view.zoom !== '100%') flag('routing', `Ctrl/Cmd+0 after ${gesture} left the canvas at ${view.zoom}`);
 }
 
 function firstDiff(a: string, b: string): string {

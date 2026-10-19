@@ -1,14 +1,18 @@
-import type { Deck, Slide, SlideElement } from '@shared/deck.js';
+import type { Deck, Slide, SlideElement, TimelineEntry } from '@shared/deck.js';
 import {
   type Cursor,
   type SlideState,
+  type ExpandedEntry,
   applyAction,
+  buildEffect,
+  effectDuration,
   groupIntoSteps,
   nextCursor,
   prevCursor,
   resolveState,
   stepCount,
 } from '@shared/timeline.js';
+import { arrowHeadSize, shapeSvg } from '@shared/shapeSvg.js';
 import {
   applyStageScale,
   fitAutoTextElement,
@@ -22,9 +26,11 @@ import {
   releaseDecodedVideo,
 } from './decodedVideoPool.js';
 import { applyStaticSlideState } from './staticState.js';
+import type { VideoBlobCache } from './videoBlobCache.js';
 import {
   essentialMorphPairs,
   explicitMorphPairs,
+  restyledMorphPairs,
   unchangedMorphPairs,
   type MorphPair,
 } from '@shared/morph.js';
@@ -48,6 +54,11 @@ export interface PlayerOptions {
   resolveSrc: (src: string) => string;
   /** Notified on every cursor change, for slide counters and the editor rail. */
   onCursor?: (cursor: Cursor, steps: number) => void;
+  /**
+   * Hold the deck's video files in memory and play them from there. The
+   * browser presentation passes one; see videoBlobCache.ts for why.
+   */
+  videoBlobs?: VideoBlobCache;
 }
 
 /**
@@ -78,10 +89,36 @@ interface VideoWarmTarget {
   start: number;
 }
 
+/** Paint a text can change without moving a single glyph. */
+const TEXT_PAINT = new Set(['color', 'background', 'background-color', 'filter', 'opacity', 'text-shadow',
+  'border-color', 'box-shadow', 'text-decoration-color', '-webkit-text-stroke-color']);
+
+/**
+ * Everything about a text that decides where its glyphs land: its box size,
+ * alignment, classes and every style but paint, and its markup with colour
+ * declarations taken out. Two texts with the same layout overlay exactly.
+ */
+function textLayout(element: Extract<SlideElement, { type: 'text' }>): string {
+  const style = Object.entries(element.style).filter(([key]) => !TEXT_PAINT.has(key)).sort();
+  // A colour run is a span whose only style is its colour: without the
+  // colour it is no span at all, so recolouring a word is not a relayout.
+  const html = element.html
+    .replace(/(^|[;"'\s])(?:background-)?color\s*:[^;"']*;?/gi, '$1')
+    .replace(/\sstyle="\s*"/g, '')
+    .replace(/<span>|<\/span>/g, '');
+  return JSON.stringify([Math.round(element.w), Math.round(element.h), element.align, element.valign,
+    element.class, style, html]);
+}
+
 export class Player {
   private deck: Deck;
   private container: HTMLElement;
+  /** Deck src → URL, preferring a clip's in-memory copy once there is one. */
   private resolveSrc: (src: string) => string;
+  /** Deck src → URL on the network, whatever the blob cache holds. */
+  private networkSrc: (src: string) => string;
+  private videoBlobs: VideoBlobCache | null;
+  private offBlobReady: (() => void) | null = null;
   private onCursor?: (cursor: Cursor, steps: number) => void;
 
   private stage: HTMLElement;
@@ -90,6 +127,8 @@ export class Player {
 
   /** Timers and media listeners owned by the current step, cleared on any move. */
   private pending: ReturnType<typeof setTimeout>[] = [];
+  /** Build animations in flight. Calling one jumps it to its finished state. */
+  private effects: Array<() => void> = [];
   private mediaListeners: Array<() => void> = [];
   /** Videos already given a trim watcher, so listeners are not stacked. */
   private trimmed = new Set<string>();
@@ -100,6 +139,8 @@ export class Player {
   private intendedPlaying = new Set<string>();
   private playAttempts = new Map<string, number>();
   private playWatched = new WeakSet<HTMLVideoElement>();
+  /** Videos whose retry budget ran out mid-load, waiting for `canplay` to try again. */
+  private resumeArmed = new WeakSet<HTMLVideoElement>();
   private resizeObserver: ResizeObserver;
   /**
    * Decoded-but-idle <video> nodes rescued from slides that left the screen,
@@ -130,8 +171,22 @@ export class Player {
   constructor(opts: PlayerOptions) {
     this.deck = opts.deck;
     this.container = opts.container;
-    this.resolveSrc = opts.resolveSrc;
+    this.networkSrc = opts.resolveSrc;
+    this.videoBlobs = opts.videoBlobs ?? null;
+    // Every URL the player renders, pools or warms goes through here, so a
+    // clip's presentation key names the same URL everywhere at any moment.
+    this.resolveSrc = (src) => {
+      const url = this.networkSrc(src);
+      return this.videoBlobs?.objectUrl(url) ?? url;
+    };
     this.onCursor = opts.onCursor;
+    if (this.videoBlobs) {
+      this.videoBlobs.setInUse((objectUrl) => this.readsUrl(objectUrl));
+      // A clip landing in memory is one the lookahead was waiting for.
+      this.offBlobReady = this.videoBlobs.onReady(() => {
+        if (!this.lookaheadHold) this.warmUpcomingMedia();
+      });
+    }
 
     this.container.classList.add('player-root');
     this.stage = document.createElement('div');
@@ -226,6 +281,9 @@ export class Player {
 
   destroy(): void {
     this.clearPending();
+    this.offBlobReady?.();
+    this.offBlobReady = null;
+    this.videoBlobs?.setInUse(null);
     this.resizeObserver.disconnect();
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.onVisibilityChange);
@@ -268,7 +326,7 @@ export class Player {
     // Advancing within a slide plays the new step's build; changing slide is a
     // fresh render.
     if (target.slide === this.cursor.slide) this.advanceStep(target.step);
-    else this.goTo(target);
+    else this.goTo(target, { play: true });
   }
 
   prev(): void {
@@ -277,13 +335,28 @@ export class Player {
     this.goTo(target);
   }
 
-  goToSlide(index: number): void {
-    this.goTo({ slide: index, step: 0 });
+  /**
+   * Open a slide at its first step. A presentation passes `play` — starting
+   * the show, Home, the presenter's "go to slide" — so builds set to run on
+   * arriving at the slide run, as they do when the talk advances onto it.
+   */
+  goToSlide(index: number, opts: { play?: boolean } = {}): void {
+    this.goTo({ slide: index, step: 0 }, opts);
   }
 
-  /** Full render of a slide at a given step, with the state resolved instantly. */
-  goTo(cursor: Cursor): void {
+  /**
+   * Full render of a slide at a given step, with the state resolved instantly.
+   *
+   * With `play`, arriving at step 0 plays that step's builds as authored —
+   * the ones set to run after (or with) the slide appearing, with their
+   * delays and effects — the way advancing to any later step does. Builds
+   * that land at once with no effect are still part of the first paint, so a
+   * Morph into the slide sees them. Jumping never plays: it resolves.
+   */
+  goTo(cursor: Cursor, opts: { play?: boolean } = {}): void {
     this.clearPending();
+    // Released by the lookahead once this slide can paint.
+    this.videoBlobs?.hold();
     const slides = this.deck.slides;
     if (slides.length === 0) {
       this.stage.replaceChildren();
@@ -338,6 +411,7 @@ export class Player {
       src: string;
       key: string;
       playing: boolean;
+      failed: boolean;
     }> = [];
     for (const video of this.stage.querySelectorAll('video')) {
       carried.push({
@@ -346,6 +420,7 @@ export class Player {
         src: video.getAttribute('src') ?? '',
         key: video.dataset.mediaKey ?? '',
         playing: !video.paused && video.currentTime > 0,
+        failed: Boolean(video.error),
       });
     }
     const previousNodes = new Map<string, HTMLElement>();
@@ -418,8 +493,8 @@ export class Player {
         const src = video.getAttribute('src') ?? '';
         const match = pass === 'id'
           ? carried.find((c) =>
-            !adopted.has(c.video) && c.playing && c.id !== null && c.id === id)
-          : carried.find((c) => !adopted.has(c.video) && c.playing && c.src === src);
+            !adopted.has(c.video) && !c.failed && c.playing && c.id !== null && c.id === id)
+          : carried.find((c) => !adopted.has(c.video) && !c.failed && c.playing && c.src === src);
         if (!match || match.video === video) continue;
         adopt(video, match.video, true);
       }
@@ -439,9 +514,13 @@ export class Player {
         // just move the black box, so leave the fresh element to load. The
         // pool is checked before taking from it, so an unusable entry is not
         // silently dropped on the floor still holding an open fetch.
+        // Nor is one whose load failed, even with a frame on screen: a media
+        // element never recovers from an error by itself, so reusing it made
+        // a clip that lost its connection once dead on every later visit.
         const usable = (candidate: HTMLVideoElement | undefined): boolean =>
           candidate !== undefined
           && candidate !== video
+          && !candidate.error
           && candidate.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
         let match: HTMLVideoElement | undefined;
         if (source) {
@@ -467,7 +546,7 @@ export class Player {
     for (const { video, key } of carried) {
       if (adopted.has(video) || video.isConnected) continue;
       video.pause();
-      if (key && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      if (key && !video.error && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         this.videoPool.add(key, video);
       } else {
         releaseDecodedVideo(video);
@@ -476,8 +555,18 @@ export class Player {
 
     this.rescale();
 
-    this.applyState(slide, resolveState(slide, this.cursor.step));
+    const entering = opts.play === true && this.cursor.step === 0;
+    const entry = entering ? groupIntoSteps(slide)[0] ?? [] : [];
+    // Everything up to the first build that waits or animates happens now.
+    const waits = entry.findIndex((unit) => unit.trigger.on === 'mediaEnd'
+      || unit.trigger.delay > 0 || buildEffect(unit, slide) !== null);
+    const instant = waits < 0 ? entry : entry.slice(0, waits);
+    const played = waits < 0 ? [] : entry.slice(waits);
+    const state = resolveState(slide, played.length > 0 ? -1 : this.cursor.step);
+    if (played.length > 0) for (const unit of instant) applyAction(state, unit, slide);
+    this.applyState(slide, state);
     if (morph && previousSlide) this.runMorph(previousSlide, slide, previousNodes);
+    if (played.length > 0) this.playEntries(slide, played, state);
     this.startLookaheadWhenVisibleSlideCanPaint();
     this.onCursor?.(this.getCursor(), steps);
   }
@@ -541,6 +630,7 @@ export class Player {
   }
 
   private warmUpcomingMedia(): void {
+    this.videoBlobs?.want(this.videoBlobOrder());
     const onCurrentSlide = new Set<string>();
     for (const el of this.deck.slides[this.cursor.slide]?.elements ?? []) {
       if (el.type === 'video' && !isPendingSrc(el.src)) onCurrentSlide.add(this.resolveSrc(el.src));
@@ -558,6 +648,11 @@ export class Player {
       upcomingSlides.push(upcoming);
       for (const el of upcoming.elements) {
         if (el.type !== 'video' || isPendingSrc(el.src)) continue;
+        // A clip on its way into memory is decoded once it lands (the cache's
+        // ready listener calls back here); warming it from the network now
+        // would download it twice.
+        const network = this.networkSrc(el.src);
+        if (this.videoBlobs?.covers(network) && !this.videoBlobs.objectUrl(network)) continue;
         const src = this.resolveSrc(el.src);
         if (onCurrentSlide.has(src)) continue;
         // A decoded element is strictly better than cached bytes, so the
@@ -570,13 +665,48 @@ export class Player {
           }
           continue;
         }
-        if (this.warmedSrcs.has(src)) continue;
+        // Bytes already in memory need no HTTP cache.
+        if (this.warmedSrcs.has(src) || src !== network) continue;
         if (!this.warmQueue.includes(src)) this.warmQueue.push(src);
       }
     }
     this.warmUpcomingVideoElements(videoTargets);
     this.warmUpcomingImages(upcomingSlides);
     this.pumpWarmQueue();
+  }
+
+  /**
+   * The deck's clips in the order the blob cache should fetch them: the next
+   * two slides first (what the talk reaches soonest), then the slide on
+   * screen, whose elements are already streaming it but whose revisits and
+   * loops should not have to, then the rest of the talk ahead, then what lies
+   * behind, nearest first. Skipped slides are not part of the talk.
+   */
+  private videoBlobOrder(): string[] {
+    const slides = this.deck.slides;
+    const here = this.cursor.slide;
+    const ahead: number[] = [];
+    const behind: number[] = [];
+    for (let i = here + 1; i < slides.length; i += 1) if (!slides[i].skipped) ahead.push(i);
+    for (let i = here - 1; i >= 0; i -= 1) if (!slides[i].skipped) behind.push(i);
+    const order = [...ahead.slice(0, WARM_AHEAD_SLIDES), here, ...ahead.slice(WARM_AHEAD_SLIDES), ...behind];
+    const urls: string[] = [];
+    for (const index of order) {
+      for (const el of slides[index]?.elements ?? []) {
+        if (el.type === 'video' && !isPendingSrc(el.src)) urls.push(this.networkSrc(el.src));
+      }
+    }
+    return urls;
+  }
+
+  /** Whether any element this player owns, on the stage or parked, reads `url`. */
+  private readsUrl(url: string): boolean {
+    const videos = [
+      ...this.stage.querySelectorAll('video'),
+      ...this.videoPool.values(),
+      ...(this.videoWarmInFlight ? [this.videoWarmInFlight.video] : []),
+    ];
+    return videos.some((video) => video.getAttribute('src') === url);
   }
 
   /**
@@ -622,6 +752,7 @@ export class Player {
     video.playsInline = true;
     video.muted = true;
     video.dataset.mediaKey = target.key;
+    video.addEventListener('error', () => video.classList.add('media-failed'));
     const entry = { key: target.key, video };
     this.videoWarmInFlight = entry;
     // Listeners first, then the source: assigning src is what starts the load,
@@ -772,6 +903,17 @@ export class Player {
       pairedSources.add(pair[0].id);
       pairedTargets.add(pair[1].id);
     }
+    // The same object recoloured on the next slide blends its paint rather
+    // than fading out while a recoloured copy fades in.
+    const restyled = restyledMorphPairs(
+      previous.elements.filter((element) => !pairedSources.has(element.id)),
+      next.elements.filter((element) => !pairedTargets.has(element.id)),
+    );
+    for (const pair of restyled) {
+      pairs.push(pair);
+      pairedSources.add(pair[0].id);
+      pairedTargets.add(pair[1].id);
+    }
 
     // Stacking during the transition. Paint order is normally DOM order (the
     // slide renders its elements z-sorted), but ghosts have to be appended
@@ -836,11 +978,11 @@ export class Player {
       // easing applies per property segment, so the motion still eases across
       // the whole duration while the stacking offsets below stay in wall time,
       // flipping at the same real midpoint as every discrete switch.
-      node.animate([
+      const motion = (opacity: [string, string]): Keyframe[] => [
         {
           transform: startTransform,
           transformOrigin: origin,
-          opacity: String(from.opacity),
+          opacity: opacity[0],
           offset: 0,
           easing,
           ...(stacking.length ? { zIndex: stacking[0].zIndex } : {}),
@@ -849,11 +991,13 @@ export class Player {
         {
           transform: finalTransform,
           transformOrigin: origin,
-          opacity: String(to.opacity),
+          opacity: opacity[1],
           offset: 1,
           ...(stacking.length ? { zIndex: stacking[3].zIndex } : {}),
         },
-      ], { duration, easing: 'linear', fill: 'none' });
+      ];
+      node.animate(motion([String(from.opacity), String(to.opacity)]), { duration, easing: 'linear', fill: 'none' });
+      this.blendMorphPaint(from, to, node, previousNodes, motion, { duration, easing });
     }
 
     // Genuinely new objects (nothing on the source slide is even essentially
@@ -925,6 +1069,108 @@ export class Player {
   }
 
   /**
+   * Carry a paired object's paint across a Morph instead of switching it.
+   *
+   * A shape's fill, stroke, stroke width and filter (its shadow) are
+   * interpolated on the shape itself, so a recoloured box changes colour as
+   * it moves. Anything else whose look changed (a text's colour, a text box's
+   * fill) is blended: a copy of the source object rides exactly over the
+   * target, with the same motion, and fades away while the target stays
+   * opaque beneath it, so every pixel moves in a straight line from the old
+   * paint to the new instead of the object dipping out and back in.
+   */
+  private blendMorphPaint(
+    from: SlideElement,
+    to: SlideElement,
+    node: HTMLElement,
+    previousNodes: Map<string, HTMLElement>,
+    motion: (opacity: [string, string]) => Keyframe[],
+    timing: { duration: number; easing: string },
+  ): void {
+    const { duration, easing } = timing;
+    const style = (element: SlideElement, property: string): string => element.style[property] ?? '';
+    const filterChanged = style(from, 'filter') !== style(to, 'filter');
+
+    // A gradient cannot be tweened as one paint value, so a gradient fill that
+    // changes at all crossfades like any other restyle below.
+    const gradientChanged = from.type === 'shape' && to.type === 'shape'
+      && Boolean(from.fillGradient || to.fillGradient);
+    if (from.type === 'shape' && to.type === 'shape' && !gradientChanged) {
+      const paint = (shape: typeof from): Keyframe => ({
+        // A shape with no fill blends from (or to) the same colour, clear.
+        fill: shape.shape === 'line' || shape.shape === 'arrow' ? 'none' : shape.fill ?? 'transparent',
+        stroke: shape.stroke ?? 'transparent',
+        strokeWidth: `${shape.strokeWidth}px`,
+      });
+      const start = paint(from);
+      const end = paint(to);
+      const changed = start.fill !== end.fill || start.stroke !== end.stroke
+        || start.strokeWidth !== end.strokeWidth;
+      const svg = node.querySelector('svg');
+      const drawn = svg?.querySelector<SVGElement>(':scope > :is(rect, ellipse, line, path)');
+      if (changed && drawn?.animate) {
+        drawn.animate([{ ...start, easing }, end], { duration, fill: 'none' });
+        // Heads and a curve's round ends are filled with the stroke colour:
+        // a line's heads are paths of their own, a drawn path's sit in a marker.
+        if (start.stroke !== end.stroke) {
+          for (const head of svg?.querySelectorAll<SVGElement>(':scope > path.arrowhead, :scope > circle, marker path') ?? []) {
+            head.animate?.([{ fill: start.stroke, easing }, { fill: end.stroke }], { duration, fill: 'none' });
+          }
+        }
+      }
+      if (filterChanged && node.animate) {
+        node.animate([
+          { filter: style(from, 'filter') || 'none', easing },
+          { filter: style(to, 'filter') || 'none' },
+        ], { duration, fill: 'none' });
+      }
+      return;
+    }
+
+    const { x: _fx, y: _fy, w: _fw, h: _fh, rot: _fr, z: _fz, id: _fi, morphId: _fm, lineageId: _fl, ...fromLook } = from;
+    const { x: _tx, y: _ty, w: _tw, h: _th, rot: _tr, z: _tz, id: _ti, morphId: _tm, lineageId: _tl, ...toLook } = to;
+    if (JSON.stringify(fromLook) === JSON.stringify(toLook)) return;
+    const source = previousNodes.get(from.id);
+    if (!source || !node.animate) return;
+    const ghost = source.cloneNode(true) as HTMLElement;
+    ghost.classList.add('morph-ghost');
+    delete ghost.dataset.elementId;
+    ghost.setAttribute('aria-hidden', 'true');
+    ghost.style.pointerEvents = 'none';
+    ghost.style.visibility = 'visible';
+    // Laid in the target's box, so the target's motion is the ghost's too.
+    for (const property of ['left', 'top', 'width', 'height', 'transform'] as const) {
+      ghost.style[property] = node.style[property];
+    }
+    node.after(ghost);
+    // Text that changed its words is a different title in the same place:
+    // dissolving one through the other shows both, overlapping, for most of
+    // the transition. So is text laid out differently (another alignment,
+    // size, face or box): the copy, laid in the target's box, sits beside
+    // the target rather than over it. Either moves as one object and swaps
+    // at the midpoint; only a change of paint dissolves.
+    const words = (element: SlideElement): string | null => (element.type === 'text'
+      ? element.html.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim()
+      : null);
+    const swap = from.type === 'text' && to.type === 'text'
+      && (words(from) !== words(to) || textLayout(from) !== textLayout(to));
+    const animation = ghost.animate(
+      motion(swap ? [String(from.opacity), String(from.opacity)] : [String(from.opacity), '0']),
+      { duration, easing: 'linear', fill: 'forwards' },
+    );
+    if (swap) {
+      const hard = (before: string, after: string): Keyframe[] => [
+        { opacity: before, offset: 0 }, { opacity: before, offset: 0.5 },
+        { opacity: after, offset: 0.5 }, { opacity: after, offset: 1 },
+      ];
+      ghost.animate(hard(String(from.opacity), '0'), { duration, easing: 'linear', fill: 'forwards' });
+      node.animate(hard('0', String(to.opacity)), { duration, easing: 'linear', fill: 'none' });
+    }
+    const remove = (): void => ghost.remove();
+    void animation.finished.then(remove, remove);
+  }
+
+  /**
    * Run the entries belonging to `step` against the DOM already on screen,
    * honouring delays and media-end chaining so builds play as authored.
    */
@@ -934,17 +1180,25 @@ export class Player {
     this.cursor = { slide: this.cursor.slide, step };
     this.notifyWebFrames({ source: WEB_BRIDGE_SOURCE, event: 'step', step, steps: stepCount(slide) });
 
-    const entries = groupIntoSteps(slide)[step] ?? [];
     // State is tracked incrementally so each action lands on top of what the
     // previous ones did, matching what `resolveState` would produce.
-    const state = resolveState(slide, step - 1);
+    this.playEntries(slide, groupIntoSteps(slide)[step] ?? [], resolveState(slide, step - 1));
+    this.onCursor?.(this.getCursor(), stepCount(slide));
+  }
 
+  /**
+   * Run a step's entries against the DOM already on screen, honouring
+   * delays, media-end chaining and effects so builds play as authored.
+   */
+  private playEntries(slide: Slide, entries: ExpandedEntry[], state: SlideState): void {
     let cumulativeDelay = 0;
+    // An animated build takes time, and "after previous" means after it has
+    // finished, as in Keynote: the next one waits until everything started
+    // so far has ended — a slow dissolve is not over just because something
+    // instant ran with it.
+    let latestEnd = 0;
     for (const entry of entries) {
-      const run = () => {
-        applyAction(state, entry, slide);
-        this.applyState(slide, state);
-      };
+      const run = () => this.runEntry(slide, entry, state);
 
       if (entry.trigger.on === 'mediaEnd' && entry.trigger.ref) {
         this.onMediaEnd(entry.trigger.ref, () => {
@@ -956,16 +1210,83 @@ export class Player {
 
       // `click` opens the step and `afterPrev` chains from the previous entry;
       // `withPrev` fires alongside it, so only the chaining forms accumulate.
-      if (entry.trigger.on === 'afterPrev') cumulativeDelay += entry.trigger.delay;
+      if (entry.trigger.on === 'afterPrev') cumulativeDelay = latestEnd + entry.trigger.delay;
       else if (entry.trigger.on === 'withPrev') {
         // keep cumulativeDelay as-is: fire together with the previous action
       } else cumulativeDelay = entry.trigger.delay;
+      const effect = buildEffect(entry, slide);
+      latestEnd = Math.max(latestEnd, cumulativeDelay + (effect ? effectDuration(entry, effect) : 0));
 
       if (cumulativeDelay > 0) this.later(run, cumulativeDelay);
       else run();
     }
+  }
 
-    this.onCursor?.(this.getCursor(), stepCount(slide));
+  /** One entry, live: its action, and the animation it is authored with. */
+  private runEntry(slide: Slide, entry: ExpandedEntry, state: SlideState): void {
+    const effect = buildEffect(entry, slide);
+    const duration = effect ? effectDuration(entry, effect) : 0;
+    const target = entry.action.target;
+    // A dissolve out is a copy fading over the spot the element is leaving,
+    // so the element itself is hidden at once and the state stays exact.
+    const fade = effect === 'dissolve' || effect === 'blur' ? effect : null;
+    if (fade && entry.action.type === 'disappear') this.dissolveOut(target, duration, fade === 'blur');
+    applyAction(state, entry, slide);
+    this.applyState(slide, state);
+    if (effect === 'draw') this.drawIn(slide, entry, duration);
+    else if (fade && entry.action.type === 'appear') this.dissolveIn(target, duration, fade === 'blur');
+  }
+
+  /**
+   * Keyframes for a fade, and for a blur the focus pull with it. The blur is
+   * added in front of any filter the element already has (a drop shadow, an
+   * effect), so the same filter list interpolates and the element's own look
+   * is untouched once the animation ends.
+   */
+  private fadeFrames(node: HTMLElement, blurred: boolean, inward: boolean): Keyframe[] {
+    const style = getComputedStyle(node);
+    const opacity = style.opacity || '1';
+    const own = style.filter && style.filter !== 'none' ? ` ${style.filter}` : '';
+    const hidden: Keyframe = { opacity: '0', ...(blurred ? { filter: `blur(${BLUR_RADIUS}px)${own}` } : {}) };
+    const shown: Keyframe = { opacity, ...(blurred ? { filter: `blur(0px)${own}` } : {}) };
+    return inward ? [hidden, shown] : [shown, hidden];
+  }
+
+  private nodeFor(id: string): HTMLElement | null {
+    return this.stage.querySelector<HTMLElement>(`[data-element-id="${CSS.escape(id)}"]`);
+  }
+
+  /** Fade an element that has just been made visible up from nothing (and into focus, for a blur). */
+  private dissolveIn(id: string, duration: number, blurred = false): void {
+    const node = this.nodeFor(id);
+    if (!node?.animate || duration <= 0 || node.style.visibility === 'hidden') return;
+    const animation = node.animate(
+      this.fadeFrames(node, blurred, true),
+      { duration, easing: 'ease-in-out', fill: 'none' },
+    );
+    this.effects.push(() => animation.finish());
+  }
+
+  /**
+   * Fade an element out: a copy of it, laid exactly over it in the same
+   * paint order, fades while the element itself is already gone.
+   */
+  private dissolveOut(id: string, duration: number, blurred = false): void {
+    const node = this.nodeFor(id);
+    if (!node?.animate || duration <= 0 || node.style.visibility === 'hidden') return;
+    const ghost = node.cloneNode(true) as HTMLElement;
+    freezeClonedVideos(node, ghost);
+    ghost.removeAttribute('data-element-id');
+    ghost.setAttribute('aria-hidden', 'true');
+    ghost.style.pointerEvents = 'none';
+    node.after(ghost);
+    const animation = ghost.animate(
+      this.fadeFrames(node, blurred, false),
+      { duration, easing: 'ease-in-out', fill: 'forwards' },
+    );
+    const remove = (): void => ghost.remove();
+    void animation.finished.then(remove, remove);
+    this.effects.push(() => { animation.cancel(); remove(); });
   }
 
   /** Reconcile the DOM and media playback with a computed slide state. */
@@ -1049,7 +1370,29 @@ export class Player {
   private retryPlayback(id: string, video: HTMLVideoElement): void {
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     const attempts = this.playAttempts.get(id) ?? 0;
-    if (attempts >= PLAY_RETRY_LIMIT) return;
+    if (attempts >= PLAY_RETRY_LIMIT) {
+      // The budget is for a browser that keeps pausing a clip it could play.
+      // A clip still loading is not that case. Giving up on it left a slide's
+      // clips frozen once their bytes did arrive, until the presenter stepped
+      // back and forward. So start it again once it can play.
+      if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA && !video.error
+        && !this.resumeArmed.has(video)) {
+        this.resumeArmed.add(video);
+        const resume = (): void => {
+          this.resumeArmed.delete(video);
+          if (!this.intendedPlaying.has(id) || this.blanked || !video.isConnected
+            || video.dataset.holdFrame === 'true') return;
+          this.playAttempts.delete(id);
+          void video.play().catch(() => this.retryPlayback(id, video));
+        };
+        video.addEventListener('canplay', resume, { once: true });
+        this.mediaListeners.push(() => {
+          video.removeEventListener('canplay', resume);
+          this.resumeArmed.delete(video);
+        });
+      }
+      return;
+    }
     this.playAttempts.set(id, attempts + 1);
     const timer = setTimeout(() => {
       if (!this.intendedPlaying.has(id) || this.blanked || !video.isConnected
@@ -1122,9 +1465,127 @@ export class Player {
     this.pending.push(setTimeout(fn, ms));
   }
 
+  /**
+   * Draw a line or arrow in from its start to its end.
+   *
+   * The element has just been made visible at full length; this shortens its
+   * stroke to nothing in the same task, so the whole line is never painted,
+   * and then lengthens it frame by frame. Only live forward playback draws:
+   * jumping to a step resolves the slide instantly, the way a delay collapses.
+   */
+  private drawIn(slide: Slide, entry: TimelineEntry, duration: number): void {
+    const el = slide.elements.find((candidate) => candidate.id === entry.action.target);
+    if (!el || el.type !== 'shape') return;
+    const svg = this.stage.querySelector<SVGSVGElement>(`[data-element-id="${CSS.escape(el.id)}"] svg`);
+    // The stroke is the SVG's own child; an arrowhead's path sits in <defs>.
+    const stroke = svg?.querySelector<SVGElement>(':scope > :is(line, path, rect, ellipse)') ?? null;
+    if (!svg || !stroke || duration <= 0) return;
+
+    // A line or arrow is redrawn each frame as the piece of itself drawn so
+    // far (shapeSvg's drawProgress), heads and all, so a head rides the tip
+    // and the last frame is the static drawing exactly. An outline (a box, an
+    // ellipse, a drawn path) is traced with a dash as long as the outline,
+    // slid into place; its fill comes in once the outline is nearly closed,
+    // the way a drawn shape is coloured in.
+    const open = el.shape === 'line' || el.shape === 'arrow';
+    const template = document.createElement('template');
+    const drawOpen = (progress: number): void => {
+      template.innerHTML = shapeSvg(el, { drawProgress: progress });
+      const fresh = template.content.firstElementChild;
+      if (fresh) svg.replaceChildren(...fresh.childNodes);
+    };
+    const length = open ? 0 : (stroke as SVGGeometryElement).getTotalLength?.() ?? 0;
+    if (!open && !(length > 0)) return;
+    const filled = !open && el.fill !== null;
+    // A traced path's end marker sits at the path's last point, so it would be
+    // there from the first frame. While it draws, the marker is lifted off and
+    // a copy of the head rides the tip instead, turned along the path.
+    const geometry = stroke as SVGGeometryElement;
+    const markerEnd = !open ? stroke.getAttribute('marker-end') : null;
+    let head: SVGPathElement | null = null;
+    if (markerEnd) {
+      stroke.removeAttribute('marker-end');
+      head = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      // The marker's own triangle (shapeSvg's arrowMarker: a 6x6 box, its
+      // point at 5,3, drawn arrowHeadSize wide in the path's units).
+      head.setAttribute('d', 'M0,0 L6,3 L0,6 Z');
+      head.setAttribute('fill', stroke.getAttribute('stroke') ?? 'currentColor');
+      stroke.after(head);
+    }
+    const placeHead = (progress: number): void => {
+      if (!head) return;
+      const at = length * progress;
+      const tip = geometry.getPointAtLength(at);
+      // The direction comes from just behind the tip, or just ahead of it at the start.
+      const other = geometry.getPointAtLength(at > 0.5 ? at - 0.5 : Math.min(length, at + 0.5));
+      const forward = at > 0.5;
+      const angle = (Math.atan2(
+        forward ? tip.y - other.y : other.y - tip.y,
+        forward ? tip.x - other.x : other.x - tip.x,
+      ) * 180) / Math.PI;
+      // The same placement the marker has: its size, anchored at its refX/refY.
+      head.setAttribute('transform', `translate(${tip.x} ${tip.y}) rotate(${angle})`
+        + ` scale(${arrowHeadSize(el) / 6}) translate(-5 -3)`);
+      head.style.opacity = progress > 0 ? '1' : '0';
+    };
+    const show = (progress: number): void => {
+      if (open) {
+        drawOpen(progress);
+        return;
+      }
+      if (progress >= 1) {
+        stroke.style.removeProperty('stroke-dasharray');
+        stroke.style.removeProperty('stroke-dashoffset');
+        stroke.style.removeProperty('fill-opacity');
+        if (head) {
+          head.remove();
+          head = null;
+          stroke.setAttribute('marker-end', markerEnd!);
+        }
+        return;
+      }
+      stroke.style.strokeDasharray = `${length} ${length}`;
+      stroke.style.strokeDashoffset = String(length * (1 - progress));
+      if (filled) stroke.style.fillOpacity = String(Math.max(0, (progress - 0.6) / 0.4));
+      placeHead(progress);
+    };
+    const ease = (t: number): number => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2);
+
+    let done = false;
+    let frame = 0;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      cancelAnimationFrame(frame);
+      clearTimeout(fallback);
+      show(1);
+    };
+    const started = performance.now();
+    const tick = (now: number): void => {
+      if (done) return;
+      // A re-render replaced the slide; the new node is already complete.
+      if (!svg.isConnected || (!open && !stroke.isConnected)) { done = true; clearTimeout(fallback); return; }
+      const t = Math.min(1, Math.max(0, (now - started) / duration));
+      if (t >= 1) finish();
+      else {
+        show(ease(t));
+        frame = requestAnimationFrame(tick);
+      }
+    };
+    show(0);
+    frame = requestAnimationFrame(tick);
+    // A window that is hidden or throttled gets no animation frames, and a
+    // line must never be left half drawn because nobody was watching it.
+    const fallback = setTimeout(finish, duration + 250);
+    this.effects.push(finish);
+  }
+
   private clearPending(): void {
     for (const t of this.pending) clearTimeout(t);
     this.pending = [];
+    // The next step (or the next slide) starts from finished animations.
+    for (const finish of this.effects) finish();
+    this.effects = [];
     for (const off of this.mediaListeners) off();
     this.mediaListeners = [];
     // The listeners those ids refer to have just been removed, so a fresh
@@ -1326,6 +1787,9 @@ export function matchMorphElements(
 ): Array<[SlideElement, SlideElement]> {
   return explicitMorphPairs(previous, next);
 }
+
+/** How far out of focus a blur build starts (or ends), in canvas px. */
+const BLUR_RADIUS = 24;
 
 /**
  * Replace the `<video>` nodes in a cloned subtree with a still of the frame the

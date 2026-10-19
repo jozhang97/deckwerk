@@ -1,3 +1,4 @@
+import { curvedShadowClasses } from '@shared/shapeShadow.js';
 import { MIRRORED_TEXT_STYLE_PROPERTIES } from '@shared/deck.js';
 import type { Deck, MediaEffect, Slide, SlideElement } from '@shared/deck.js';
 import { fitScale } from '@shared/geometry.js';
@@ -9,7 +10,7 @@ import { prepareSlideLinks } from './links.js';
 import { quadraticPath, shapeSvg } from '@shared/shapeSvg.js';
 import { isMediaBorderPaint, typedPropertyOwnsCss } from '@shared/nativeCss.js';
 import { applyTableColumnWidths } from '@shared/paragraphs.js';
-import { isEmbeddableWebSrc } from '@shared/webBridge.js';
+import { isEmbeddableWebSrc, webReadinessAction } from '@shared/webBridge.js';
 import renderMathInElement from 'katex/contrib/auto-render';
 import 'katex/dist/katex.min.css';
 
@@ -238,7 +239,7 @@ export function renderElement(
   node.dataset.elementId = el.id;
   node.dataset.elementType = el.type;
 
-  applyElementBoxStyles(node, el);
+  applyElementBoxStyles(node, el, undefined, opts.resolveSrc);
 
   const body = renderBody(el, opts);
   if (
@@ -270,12 +271,16 @@ export function renderElement(
  * One function, called by both paths, removes that whole failure mode.
  *
  * `previous` is the element as it was last rendered, when known: keys it had
- * and this one does not must be cleared from a reused node.
+ * and this one does not must be cleared from a reused node. `resolveSrc`
+ * points a deck-relative `url(assets/…)` in the element's own CSS (a
+ * background image, text filled with a picture) at the deck's files; without
+ * it the URL resolves against the app's page and the picture never loads.
  */
 export function applyElementBoxStyles(
   node: HTMLElement,
   el: SlideElement,
   previous?: SlideElement,
+  resolveSrc?: (src: string) => string,
 ): void {
   const s = node.style;
   if (previous) {
@@ -295,8 +300,10 @@ export function applyElementBoxStyles(
       s.removeProperty(k);
       continue;
     }
-    s.setProperty(k, v);
+    s.setProperty(k, resolveSrc && v.includes('url(') ? rewriteCssAssetUrls(v, resolveSrc) : v);
   }
+  // A curved (paper) shadow is drawn by player.css from these settings.
+  node.classList.toggle('shadow-curved', curvedShadowClasses(el.style).length > 0);
   // Shape paint lives in an SVG child, but CSS effects such as box-shadow live
   // on this positioned wrapper. Give that wrapper the same contour as the SVG
   // or a circular imported frame casts a square shadow and a rounded card casts
@@ -342,6 +349,8 @@ export function applyTextRenderState(
 
   if (el.noWrap) node.dataset.noWrap = 'true';
   else delete node.dataset.noWrap;
+  if (el.autoSize) node.dataset.autoSize = 'true';
+  else delete node.dataset.autoSize;
   if (el.noWrap && el.noWrapMode === 'condense') node.dataset.fitMode = 'condense';
   else delete node.dataset.fitMode;
 
@@ -397,7 +406,9 @@ export function applyTextRenderState(
 
   // noWrap implies the fit: with soft wrapping off, shrinking is the only way
   // an overlong line stays inside the box.
-  if (el.autoFit || el.noWrap) {
+  // A box sized to its text has nothing to shrink into: the box follows the
+  // text instead.
+  if ((el.autoFit || el.noWrap) && !el.autoSize) {
     node.dataset.autoFit = 'true';
     scheduleAutoFit(node);
   } else {
@@ -634,13 +645,20 @@ export function fitAutoText(root: ParentNode): void {
   }
 }
 
-/** Defer until the rendered node has been attached and therefore has layout. */
+/**
+ * Defer until the rendered node has been attached and therefore has layout.
+ *
+ * Only a box that opted in (`data-auto-fit`, set from autoFit or noWrap) is
+ * fitted, checked when the fit runs. Editing code schedules a fit after every
+ * list edit whatever the box, and fitting a fixed-size box shrank its text:
+ * taking an empty bullet off a box saved one line too short sent it to 6px.
+ */
 export function scheduleAutoFit(node: HTMLElement): void {
   if (pendingTextFits.has(node)) return;
   pendingTextFits.add(node);
   const run = () => {
     pendingTextFits.delete(node);
-    if (node.isConnected) fitAutoTextElement(node);
+    if (node.isConnected && node.dataset.autoFit === 'true') fitAutoTextElement(node);
   };
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
   else setTimeout(run, 0);
@@ -800,6 +818,10 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
  * Morph and layout previews) show the poster when there is one and otherwise
  * an inert frame — inert so the editor's own pointer handling keeps working
  * over it. The live frame only exists where the deck is being presented.
+ *
+ * A live frame is hidden until its page is ready (see `revealWhenReady`), with
+ * the poster laid over it meanwhile: a page that lays itself out from script
+ * otherwise flashes its raw, unpositioned state the moment the slide appears.
  */
 function renderWeb(
   el: Extract<SlideElement, { type: 'web' }>,
@@ -852,7 +874,112 @@ function renderWeb(
   // author wants clicks on the page to advance the deck instead.
   frame.style.pointerEvents = preview || !el.interactive ? 'none' : 'auto';
   box.appendChild(frame);
+  if (!preview) revealWhenReady(box, frame, el.poster ? opts.resolveSrc(el.poster) : null, el.title);
   return box;
+}
+
+/**
+ * How long a live web page may stay hidden waiting to be ready. A page that
+ * never finishes loading (a stalled request inside it) or never releases a
+ * `deckwerk.ready(promise)` is shown anyway after this — as it is.
+ */
+export const WEB_REVEAL_TIMEOUT_MS = 5_000;
+
+/** Settles once a live web element is showing its page (see `revealWhenReady`). */
+const webReady = new WeakMap<Element, Promise<void>>();
+
+/**
+ * Resolves once the live web element rendered as `box` (its `.web-body`)
+ * shows its page — readied or timed out. Print readiness waits on this so a
+ * PDF page is not captured with the frame still hidden. Anything that is not
+ * a live web box resolves at once.
+ */
+export function whenWebElementReady(box: Element): Promise<void> {
+  return webReady.get(box) ?? Promise.resolve();
+}
+
+/**
+ * Keep a live frame hidden until its page is ready to be seen.
+ *
+ * Ready is the frame's `load` plus two animation frames, so whatever the
+ * page's load handlers lay out has been painted. A page can ask for longer
+ * through the bridge runtime: `deckwerk.ready(promise)` posts `hold-ready`
+ * while the page's scripts first run (before `load`) and `ready` when the
+ * promise settles. Pages without the runtime, or that never call it, get the
+ * default. Until then the poster, if there is one, covers the frame; the
+ * frame itself is `visibility: hidden`, which still loads and runs it. A
+ * timeout shows the page however far it got.
+ */
+function revealWhenReady(
+  box: HTMLElement,
+  frame: HTMLIFrameElement,
+  posterSrc: string | null,
+  title: string,
+): void {
+  box.style.position = 'relative';
+  box.dataset.webReady = 'false';
+  frame.style.visibility = 'hidden';
+  let poster: HTMLImageElement | null = null;
+  if (posterSrc) {
+    poster = document.createElement('img');
+    poster.className = 'web-poster';
+    poster.src = posterSrc;
+    poster.alt = title;
+    poster.setAttribute('aria-hidden', 'true');
+    poster.draggable = false;
+    Object.assign(poster.style, {
+      position: 'absolute', inset: '0', width: '100%', height: '100%',
+      objectFit: 'contain', display: 'block', pointerEvents: 'none',
+    });
+    box.appendChild(poster);
+  }
+
+  let held = false;
+  let loaded = false;
+  let painted = false;
+  let released = false;
+  let revealed = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let resolveReady!: () => void;
+  webReady.set(box, new Promise<void>((resolve) => { resolveReady = resolve; }));
+  const nextFrame = (callback: () => void): void => {
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => callback());
+    else setTimeout(callback, 16);
+  };
+
+  const reveal = (): void => {
+    if (revealed) return;
+    revealed = true;
+    clearTimeout(timer);
+    window.removeEventListener('message', onMessage);
+    frame.style.visibility = '';
+    poster?.remove();
+    box.dataset.webReady = 'true';
+    resolveReady();
+  };
+  const settle = (): void => {
+    if (painted && (!held || released)) reveal();
+  };
+  const onMessage = (event: MessageEvent): void => {
+    if (event.source === null || event.source !== frame.contentWindow) return;
+    const action = webReadinessAction(event.data);
+    if (action === 'hold-ready') held = true;
+    else if (action === 'ready') {
+      released = true;
+      settle();
+    }
+  };
+  window.addEventListener('message', onMessage);
+  frame.addEventListener('load', () => {
+    // A frame re-inserted into the document loads again; only the first counts.
+    if (loaded) return;
+    loaded = true;
+    nextFrame(() => nextFrame(() => {
+      painted = true;
+      settle();
+    }));
+  });
+  timer = setTimeout(reveal, WEB_REVEAL_TIMEOUT_MS);
 }
 
 /**
@@ -1006,6 +1133,9 @@ function renderVideo(
   const video = document.createElement('video');
   video.playsInline = true;
   video.dataset.mediaKey = videoPresentationKey(el, opts.resolveSrc(el.src));
+  // Black only once decoding has failed (player.css): a black surface behind a
+  // working video shows as a dark hairline at its scaled edges on light slides.
+  video.addEventListener('error', () => video.classList.add('media-failed'));
   const preload = opts.mediaPreload ?? 'auto';
   // The preload hint must be in place before src: assigning src is what
   // starts resource selection, and it reads the hint of that moment.

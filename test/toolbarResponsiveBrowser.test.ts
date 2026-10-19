@@ -98,13 +98,13 @@ describe.skipIf(!electronBinary)('responsive desktop toolbar', () => {
   }, async () => {
     editor = await launchDesktopEditor('toolbar-fixture', 'Toolbar fixture');
 
-    // The File menu carries New / Open / Import / Save As at every width, so
-    // a medium window keeps Insert centred and simply drops the deck name.
+    // PyMOL and the sidebar toggle join the upstream controls, so a medium
+    // window uses More to keep the insert and presentation groups apart.
     const medium = await toolbarAt(900, (layout) => layout.fileVisible
-      && layout.classes.includes('toolbar-hide-deck-name'));
+      && layout.classes.includes('toolbar-compact-secondary'));
     expect(medium.height).toBe(44);
     expect(medium.fileVisible).toBe(true);
-    expect(medium.moreVisible).toBe(false);
+    expect(medium.moreVisible).toBe(true);
     expect(medium.leftRight).toBeLessThanOrEqual(medium.centerLeft);
     expect(medium.centerRight).toBeLessThanOrEqual(medium.rightLeft);
     expect(medium.insertLabels).toEqual(expect.arrayContaining(['Text', 'Shape', 'Table']));

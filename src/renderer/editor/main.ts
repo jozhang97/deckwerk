@@ -2,13 +2,15 @@ import '../player/player.css';
 import '../appChrome.css';
 import './editor.css';
 import '../collab/collab.css';
-import { applyAgentTransaction } from '@shared/agent.js';
+import '../lightTheme.css';
+import { applyUiTheme } from '../uiTheme.js';
+import { applyAgentOperations, applyAgentTransaction, type AgentOperation } from '@shared/agent.js';
 import type { Deck, SlideElement } from '@shared/deck.js';
 import { emptyDeck } from '@shared/deck.js';
 import type { AgentSessionConnection, AuthoredHtmlFile, PresentationImportResult } from '@shared/ipc.js';
 import { captureEditorView, decodeEditorView, restoreEditorView } from '@shared/editorView.js';
 import { makeId, setIdSuffix } from '@shared/geometry.js';
-import { adoptAuthoredIds, describeHtmlSync, htmlSyncSummary } from '@shared/htmlSlides.js';
+import { adoptAuthoredIds, describeHtmlSync, htmlSyncSummary, pageStampOf, stampPage } from '@shared/htmlSlides.js';
 import { rangeForSlideSelection } from '@shared/presentationRange.js';
 import {
   themeById,
@@ -61,6 +63,8 @@ import { setSelectionInvariantChecks } from './selectionInvariants.js';
 import { SpeakerNotesDrawer } from './speakerNotesDrawer.js';
 import { applySpeakerNotes } from '@shared/speakerNotes.js';
 import { installResponsiveToolbar } from './responsiveToolbar.js';
+
+applyUiTheme();
 
 /**
  * Editor shell: wires the panels to one store, owns the toolbar, the keyboard
@@ -122,8 +126,9 @@ const initialView = decodeEditorView(new URLSearchParams(location.search).get('v
 let initialViewPending = initialView !== null;
 // Development builds verify after every in-place patch that the canvas DOM
 // still matches a fresh render of the deck, and report any property the two
-// paths disagree about. See renderInvariants.ts.
-setRenderInvariantChecks(import.meta.env.DEV);
+// paths disagree about. See renderInvariants.ts. The test builds turn it on
+// too (VITE_RENDER_INVARIANTS), so the fuzz walks fail on what it reports.
+setRenderInvariantChecks(import.meta.env.DEV || import.meta.env.VITE_RENDER_INVARIANTS === '1');
 setSelectionInvariantChecks(import.meta.env.DEV);
 const canvas = new EditorCanvas(el('canvas'), store);
 if (typeof window.api.importHtmlFile === 'function') {
@@ -166,6 +171,7 @@ const inspector = new Inspector(el('inspector'), store);
 new TimelinePanel(el('timeline'), store);
 new HistoryPanel(el('history'), store);
 const rail = new SlideRail(el('rail'), store);
+rail.onStatus = setStatusMessage;
 const editorBody = el('body');
 const railDivider = document.createElement('div');
 railDivider.className = 'panel-resize-divider panel-resize-rail';
@@ -298,7 +304,7 @@ window.api.onAgentRequest?.((request) => void agent.handle(request));
  * the user. The theme comes from the editor rather than from disk, so slides
  * are measured against the typography currently on screen.
  */
-window.api.onHtmlEdit?.((file) => void applyHtmlEdit(file).catch(() => undefined));
+window.api.onHtmlEdit?.((file) => void applyHtmlEdit(file, { watched: true }).catch(() => undefined));
 // notes.md saved outside the editor: the file is the whole set of notes, so
 // apply it to every slide as one undoable edit. The autosave that follows
 // rewrites deck.json and the file itself in normalised form.
@@ -325,16 +331,32 @@ let htmlEditQueue: Promise<unknown> = Promise.resolve();
  */
 const lastHtmlSync = new Map<string, { contents: string; outcome: HtmlSyncOutcome }>();
 
+/**
+ * New slides a watched save added at the end, per file, with the page as it
+ * was saved and as it was stamped: no `apply --after` has said where they go
+ * yet. An agent writes the page with one tool and runs apply with the next,
+ * so the watcher has nearly always synced the save by the time apply asks.
+ */
+const unplacedHtml = new Map<string, { contents: Set<string>; ids: string[]; outcome: HtmlSyncOutcome }>();
+
 function applyHtmlEdit(
   file: AuthoredHtmlFile,
-  options: { after?: string | null; label?: string } = {},
+  options: { after?: string | null; label?: string; watched?: boolean } = {},
 ): Promise<HtmlSyncOutcome> {
   // Serialised: two saves in flight would compile against the same deck and
   // the second would apply operations built from a deck that no longer exists.
   const run = htmlEditQueue.then(async (): Promise<HtmlSyncOutcome> => {
     const name = fileName(file.path);
+    const unplaced = unplacedHtml.get(file.path);
+    if (unplaced && options.after !== undefined && unplaced.contents.has(file.contents)) {
+      const outcome = await placeSyncedSlides(name, unplaced, options.after);
+      unplacedHtml.delete(file.path);
+      return outcome;
+    }
     const previous = lastHtmlSync.get(file.path);
     if (previous && previous.contents === file.contents) return previous.outcome;
+    /** The page as stamped with the ids this sync assigned, if it was. */
+    let stampedContents: string | null = null;
     try {
       const outcome = await runOperation(`Compiling ${name}…`, async (operation): Promise<HtmlSyncOutcome> => {
         // Compiling takes a moment, and the user may edit during it. The
@@ -355,6 +377,7 @@ function applyHtmlEdit(
           const warned = warnings.length === 0 ? ''
             : ` — ${warnings.length} style warning${warnings.length === 1 ? '' : 's'}: ${warnings[0]}`;
           const summarise = (message: string, operations: typeof transaction extends null ? never : NonNullable<typeof transaction>['operations'] | []): HtmlSyncOutcome => ({
+            stamp: pageStampOf(slides),
             changes: htmlSyncSummary(operations),
             slides: slides.map((slide) => ({
               id: slide.id,
@@ -371,9 +394,12 @@ function applyHtmlEdit(
           store.replaceWithHistory(applyAgentTransaction(deck, transaction), transaction.label);
           await save();
           // Stamp the ids this compile assigned back into the file, so saving it
-          // again replaces these slides rather than inserting them a second time.
-          const adopted = adoptAuthoredIds(file.contents, slides);
+          // again replaces these slides rather than inserting them a second time
+          // — and what the page now says, which its next save is compared with.
+          const stampedPage = stampPage(adoptAuthoredIds(file.contents, slides) ?? file.contents, pageStampOf(slides));
+          const adopted = stampedPage === file.contents ? null : stampedPage;
           if (adopted) {
+            stampedContents = adopted;
             operation.update(`Writing assigned slide ids to ${name}`);
             // Main only writes inside edit/; a file elsewhere (an agent's
             // drafts/ page applied through the CLI) is stamped by the CLI from
@@ -395,6 +421,13 @@ function applyHtmlEdit(
         throw new Error(`${name}: the deck kept changing while it compiled — save it again`);
       });
       lastHtmlSync.set(file.path, { contents: file.contents, outcome });
+      const { inserted, replaced, deleted, moved } = outcome.changes;
+      if (options.watched && inserted.length > 0 && replaced.length === 0 && deleted.length === 0) {
+        unplacedHtml.set(file.path, { contents: new Set([file.contents, stampedContents ?? file.contents]), ids: inserted, outcome });
+      } else if (inserted.length + replaced.length + deleted.length + moved > 0) {
+        // The page was saved again with changes: those slides are its own now.
+        unplacedHtml.delete(file.path);
+      }
       setStatusMessage(outcome.message);
       return outcome;
     } catch (err) {
@@ -405,6 +438,36 @@ function applyHtmlEdit(
   // The queue itself never rejects, or one bad file would wedge every later save.
   htmlEditQueue = run.catch(() => undefined);
   return run;
+}
+
+/**
+ * Move the slides a watched save added at the end to where an apply that came
+ * after it says they go — where the apply would have put them had it come
+ * first. `after` is a slide id, or null for "first".
+ */
+async function placeSyncedSlides(
+  name: string,
+  unplaced: { ids: string[]; outcome: HtmlSyncOutcome },
+  after: string | null,
+): Promise<HtmlSyncOutcome> {
+  const deck = store.get().deck;
+  const ids = unplaced.ids.filter((id) => deck.slides.some((slide) => slide.id === id));
+  if (after !== null && (ids.includes(after) || !deck.slides.some((slide) => slide.id === after))) {
+    throw new Error(`${name} was already saved and its slides added at the end; there is no slide ${after} to put them after`);
+  }
+  const order = deck.slides.map((slide) => slide.id).filter((id) => !ids.includes(id));
+  const at = after === null ? 0 : order.indexOf(after) + 1;
+  order.splice(at, 0, ...ids);
+  if (ids.length > 0 && order.join() !== deck.slides.map((slide) => slide.id).join()) {
+    const operations: AgentOperation[] = ids.map((id, index) => ({
+      op: 'moveSlide', slideId: id, afterSlideId: index === 0 ? after : ids[index - 1],
+    }));
+    const label = `Place ${ids.length === 1 ? 'the new slide' : 'the new slides'} from ${name}`;
+    store.replaceWithHistory(applyAgentOperations(deck, operations), label);
+    await save();
+    setStatusMessage(`${label} after ${after ?? 'the start'}`);
+  }
+  return unplaced.outcome;
 }
 
 /* --- toolbar --- */
@@ -606,6 +669,19 @@ async function exportPdf(): Promise<void> {
     if (result) setStatusMessage(`PDF saved to ${result}`);
   } catch (err) {
     setStatusMessage(`PDF export failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** "Download original…": the dropped file, copied wherever the author picks. */
+async function saveOriginalAsset(src: string): Promise<void> {
+  try {
+    const saved = await runOperation('Preparing download…', async (operation) => {
+      operation.update('Waiting for a destination');
+      return window.api.saveOriginalAsset(src, operation.id);
+    });
+    if (saved) setStatusMessage(`Saved the original to ${saved}`);
+  } catch (err) {
+    setStatusMessage(`Download failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -1083,7 +1159,8 @@ function syncSlideSelectionContext(): void {
 /* --- element creation --- */
 
 function addText(): void {
-  insertText(store);
+  // Straight into the new box, its placeholder selected: typing replaces it.
+  canvas.beginTextEdit(insertText(store).id);
 }
 
 /* --- persistence --- */
@@ -1203,6 +1280,7 @@ const shellDeps: ShellDeps = {
   currentThemeCss: () => cssEditor.getValue(),
   openTrim,
   openRaster,
+  downloadOriginal: { label: 'Download original…', run: (element) => void saveOriginalAsset(element.src) },
   undo: () => {
     if (agentSessionReady && agentSessionBridge) agentSessionBridge.undo(store.get().deck);
     else store.undo();

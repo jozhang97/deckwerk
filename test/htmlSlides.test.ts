@@ -6,6 +6,7 @@ import {
   htmlChangeLabel,
   htmlSlideScope,
   slideFromMeasured,
+  slidesFromMeasured,
   slideToHtml,
   slidesToHtml,
   type MeasuredNode,
@@ -412,6 +413,32 @@ describe('measured nodes become deck objects', () => {
     // Paint order follows document order.
     expect(slide.elements.map((element) => element.z)).toEqual([1, 2, 3]);
   });
+
+  it('never mints a new slide an id the same page already gives an existing slide', () => {
+    // The ids of the slides a page replaces are freed so they can keep them;
+    // minting from the freed set handed a new section the id of a slide in
+    // the very same page, and the save was refused as naming one slide twice.
+    // (Found by the agent collaboration fuzz.)
+    const deck = parseDeck({
+      version: 1,
+      slides: [
+        { id: 'elsewhere' },
+        { id: 'slide-2', elements: [{ id: 'kept', type: 'text', x: 0, y: 0, w: 10, h: 10, html: 'a' }] },
+      ],
+    });
+    const blank = { name: '', notes: '', background: { color: null, image: null }, morphFromPrevious: false };
+    // The new section comes first, so it is minted before slide-2 is reached.
+    const slides = slidesFromMeasured(deck, [
+      { ...blank, id: null, nodes: [node({ tag: 'h1' })] },
+      { ...blank, id: 'slide-2', nodes: [node({ elementId: 'kept' })] },
+    ]);
+    const ids = slides.map((slide) => slide.id);
+    expect(ids[1]).toBe('slide-2');
+    expect(new Set(ids).size).toBe(2);
+    const elementIds = slides.flatMap((slide) => slide.elements.map((element) => element.id));
+    expect(elementIds).toContain('kept');
+    expect(new Set(elementIds).size).toBe(elementIds.length);
+  });
 });
 
 describe('deck objects become authored HTML', () => {
@@ -469,6 +496,32 @@ describe('deck objects become authored HTML', () => {
     expect(html).toContain('data-control="400,240"');
     expect(html).toContain('data-arrow-end="true"');
     expect(html).not.toContain('data-arrow-start');
+  });
+
+  it('round-trips a curly brace and its signed depth', () => {
+    const deck = emptyDeck('Braces');
+    const brace = {
+      id: 'brace', type: 'shape' as const, x: 200, y: 300, w: 400, h: 2, rot: 30, z: 2,
+      opacity: 1, class: [], style: {}, shape: 'brace' as const, fill: null, stroke: '#111111',
+      strokeWidth: 6, radius: 0, path: null, pathSize: null, arrowStart: false,
+      arrowEnd: false, braceDepth: -45,
+    };
+    deck.slides[0].elements = [brace];
+    const html = slideToHtml(parseDeck(deck).slides[0], { w: 1920, h: 1080 });
+    expect(html).toContain('data-shape="brace"');
+    expect(html).toContain('data-brace-depth="-45"');
+
+    const back = elementFromNode(node({
+      tag: 'div', html: '',
+      dataset: { element: 'shape', shape: 'brace', stroke: '#111111', strokeWidth: '6', braceDepth: '-45' },
+    }), 'brace', 2);
+    expect(back).toMatchObject({ shape: 'brace', braceDepth: -45 });
+    // A brace written without a depth stays without one and draws the default.
+    const bare = elementFromNode(node({
+      tag: 'div', html: '', dataset: { element: 'shape', shape: 'brace' },
+    }), 'bare', 2);
+    expect(bare).toMatchObject({ shape: 'brace' });
+    expect('braceDepth' in bare!).toBe(false);
   });
 
   it('matches the HTML preview wrapper to rounded shape effect contours', () => {

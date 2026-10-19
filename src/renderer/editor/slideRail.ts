@@ -5,11 +5,13 @@ import { freezePreviewVideos, releasePreviewVideos } from '../player/previewPost
 import { renderSlide } from '../player/render.js';
 import { applyDeckThemeToNewSlide } from '@shared/themes.js';
 import { LAYOUT_LABELS_BY_ID } from './layoutPreview.js';
-import { applySlideLayout } from './slideLayouts.js';
-import { newComment, openCommentsPopover, openCount } from './comments.js';
+import { LAYOUT_LABELS, applySlideLayout, type SlideLayout } from './slideLayouts.js';
+import { openComments } from './comments.js';
+import { openThreadCount } from '@shared/comments.js';
 import type { Deck, Slide } from '@shared/deck.js';
 import { changeSlideDepth, deleteSlidesPromotingChildren, moveSlideBranch, slideDepths, subtreeEnd } from '@shared/slideHierarchy.js';
-import { sameSlideIgnoringNotes, type EditorStore } from './store.js';
+import { sameSlideDrawing, type EditorStore } from './store.js';
+import { showConfirmDialog } from './confirmDialog.js';
 
 /**
  * The slide list. Text-first rather than thumbnail-first: rendering live
@@ -21,15 +23,55 @@ const THUMB_WIDTH = 168;
 /** Enough decoded thumbnails for the viewport plus generous scroll overscan. */
 const THUMB_CACHE_LIMIT = 40;
 
+interface MenuItem {
+  label: string;
+  action?: () => void;
+  /** A non-interactive section label rather than a command. */
+  heading?: boolean;
+  /** Present for a radio-style row; true draws its tick. */
+  checked?: boolean;
+}
+
+/**
+ * 1-based slide numbers as a reader says them: runs collapse to ranges, so
+ * [3, 4, 5, 8] reads "3–5, 8".
+ */
+export function slideNumbersLabel(indices: readonly number[]): string {
+  const sorted = [...new Set(indices)].sort((a, b) => a - b);
+  const parts: string[] = [];
+  for (let at = 0; at < sorted.length;) {
+    let end = at;
+    while (end + 1 < sorted.length && sorted[end + 1] === sorted[end] + 1) end += 1;
+    parts.push(end === at ? `${sorted[at] + 1}` : `${sorted[at] + 1}–${sorted[end] + 1}`);
+    at = end + 1;
+  }
+  return parts.join(', ');
+}
+
+function undoShortcutLabel(): string {
+  const platform = typeof navigator === 'undefined' ? '' : navigator.platform ?? '';
+  return /Mac|iPhone|iPad/i.test(platform) ? '⌘Z' : 'Ctrl+Z';
+}
+
 export interface RailPresence {
   name: string;
   color: string;
   selectedElementIds: string[];
 }
 
+export interface SlideRailOptions {
+  /**
+   * A list to look at and pick from, nothing more: no reordering, no context
+   * menu, no slide buttons, no Return-to-add or Delete. The phone client's
+   * rail, where a long press or a drifting thumb must never edit the deck.
+   */
+  readOnly?: boolean;
+}
+
 export class SlideRail {
   private host: HTMLElement;
   private store: EditorStore;
+  private readonly readOnly: boolean;
   /** Keeps cached slide surfaces scaled to the fluid thumbnail frame. */
   private thumbResizeObserver: ResizeObserver | null = null;
   /** Mount full slide DOM only near the scroll viewport. */
@@ -89,10 +131,15 @@ export class SlideRail {
   presenceForSlide?: (slideId: string) => RailPresence[];
   /** Runs for an explicit thumbnail pick, including the already-active slide. */
   onSlideActivate?: (slideIndex: number) => void;
+  /** The shell's status bar: what a slide command just did. */
+  onStatus?: (message: string) => void;
+  /** A keyboard deletion waiting on its confirmation dialog. */
+  private confirmingDelete = false;
 
-  constructor(host: HTMLElement, store: EditorStore) {
+  constructor(host: HTMLElement, store: EditorStore, options: SlideRailOptions = {}) {
     this.host = host;
     this.store = store;
+    this.readOnly = options.readOnly === true;
     if (typeof ResizeObserver !== 'undefined') {
       this.thumbResizeObserver = new ResizeObserver((entries) => {
         for (const entry of entries) this.scaleThumb(entry.target as HTMLElement);
@@ -309,6 +356,10 @@ export class SlideRail {
       i = end + 1;
     }
 
+    if (this.readOnly) {
+      this.patchChildren(children);
+      return;
+    }
     const actions = document.createElement('div');
     actions.className = 'rail-actions';
     const hide = railButton(this.hiddenActionLabel(slideIndex), () => this.toggleHidden());
@@ -351,8 +402,7 @@ export class SlideRail {
   private rekeyNoteOnlyChanges(deck: Deck): void {
     for (const slide of deck.slides) {
       const previous = this.slideById.get(slide.id);
-      if (previous && previous !== slide
-        && sameSlideIgnoringNotes({ ...previous, depth: slide.depth }, slide)) {
+      if (previous && previous !== slide && sameSlideDrawing({ ...previous, depth: slide.depth }, slide)) {
         const thumb = this.thumbCache.get(previous);
         if (thumb) {
           this.thumbCache.delete(previous);
@@ -660,6 +710,7 @@ export class SlideRail {
       this.syncGroup(item, i);
       this.rowBySlideId.set(slide.id, item);
       this.syncRowState(item, i === slideIndex, slideSelection.has(slide.id));
+      this.syncCommentState(item, slide);
       const thumb = item.querySelector<HTMLElement>(':scope > .rail-thumb');
       if (thumb) {
         this.pendingThumbs.set(thumb, { deck, slide });
@@ -673,12 +724,12 @@ export class SlideRail {
       const item = document.createElement('button');
       item.className = `rail-item${slideSelection.has(slide.id) ? ' selected' : ''}${i === slideIndex ? ' active' : ''}${slide.skipped ? ' skipped' : ''}`;
       item.setAttribute('aria-selected', String(slideSelection.has(slide.id)));
-      item.draggable = true;
+      item.draggable = !this.readOnly;
       item.dataset.index = String(i);
       item.dataset.slideId = slide.id;
       this.syncDepth(item, i);
       this.rowBySlideId.set(slide.id, item);
-      this.bindReorder(item, i);
+      if (!this.readOnly) this.bindReorder(item, i);
 
       const num = document.createElement('span');
       num.className = 'rail-num';
@@ -709,32 +760,21 @@ export class SlideRail {
         badge.textContent = 'Hidden';
         item.appendChild(badge);
       }
-      // Comment affordance in the row's bottom-right corner: hidden until
-      // hover when the slide has no comments, always visible (with the open
-      // count) when it does. A <span>, not a <button> — the row itself is a
-      // button and nesting them is invalid HTML.
-      {
-        const open = openCount(slide.comments);
-        const bubble = document.createElement('span');
-        bubble.className = `rail-comment${open > 0 ? ' has-comments' : ''}`;
-        bubble.setAttribute('role', 'button');
-        bubble.title = open > 0
-          ? `${open} open comment${open === 1 ? '' : 's'}`
-          : 'Add comment';
-        bubble.textContent = open > 0 ? String(open) : '+';
-        bubble.addEventListener('pointerdown', (e) => e.stopPropagation());
-        bubble.addEventListener('click', (e) => {
-          e.stopPropagation();
-          this.openComments(slide.id, i, bubble.getBoundingClientRect());
-        });
-        item.appendChild(bubble);
-      }
+      this.syncCommentState(item, slide);
       // Selection runs on pointerdown, not click: the row is draggable for
       // reorder, and Chromium starts a native drag on a few pixels of drift,
       // which suppresses the click entirely — every real (slightly wobbly)
-      // click on a thumbnail then did nothing.
+      // click on a thumbnail then did nothing. A read-only rail is not
+      // draggable, and is scrolled by a finger that lands on a row first: it
+      // selects on the click a tap makes and a scroll does not.
+      if (this.readOnly) {
+        item.addEventListener('click', () => {
+          this.store.selectSlide(i);
+          this.onSlideActivate?.(i);
+        });
+      }
       item.addEventListener('pointerdown', (event) => {
-        if (event.button !== 0) return;
+        if (event.button !== 0 || this.readOnly) return;
         // Shift extends a range from the anchor; Cmd/Ctrl picks or drops this
         // one row on its own, so a scattered set of slides can be deleted,
         // hidden or duplicated in one go.
@@ -747,7 +787,7 @@ export class SlideRail {
         // slides then pressing Backspace appears to do nothing at all.
         this.host.focus({ preventScroll: true });
       });
-      item.addEventListener('contextmenu', (event) => this.onContextMenu(event, i));
+      if (!this.readOnly) item.addEventListener('contextmenu', (event) => this.onContextMenu(event, i));
       this.rowCache.set(slide, { row: item, index: i });
       return item;
     }
@@ -772,11 +812,27 @@ export class SlideRail {
 
     const hidden = Boolean(this.store.get().deck.slides[index]?.skipped);
     const group = this.hasChildren(index);
-    const items: Array<{ label: string; action: () => void } | 'separator'> = [
+    // The layout rows mirror the Props tab's Preset picker. A tick marks the
+    // layout every targeted slide already wears; a mixed selection shows none.
+    const targeted = this.store.get().deck.slides
+      .filter((s) => this.store.get().slideSelection.has(s.id));
+    const layouts = new Set(targeted.map((s) => s.layout ?? 'freeform'));
+    const current = layouts.size === 1 ? [...layouts][0] : null;
+    const items: Array<MenuItem | 'separator'> = [
       { label: `${hidden ? 'Show' : 'Hide'} ${group ? 'group' : 'slide'}`, action: () => this.toggleHidden() },
       'separator',
       { label: 'Add slide below', action: () => this.addSlide() },
       { label: 'Duplicate', action: () => this.duplicateSlide() },
+      'separator',
+      { label: 'Layout', heading: true },
+      ...LAYOUT_LABELS.map(([layout, label]): MenuItem => ({
+        label,
+        checked: layout === current,
+        action: () => this.applyLayout(layout, label),
+      })),
+      'separator',
+      commentMenuItem(slide, () => this.rowBySlideId.get(slide.id)?.getBoundingClientRect()
+        ?? new DOMRect(ev.clientX, ev.clientY, 0, 0), (anchor, compose) => this.openComments(slide.id, anchor, compose)),
       'separator',
       { label: 'Delete', action: () => this.deleteSlide() },
     ];
@@ -794,11 +850,24 @@ export class SlideRail {
         menu.appendChild(hr);
         continue;
       }
+      if (item.heading) {
+        const heading = document.createElement('div');
+        heading.className = 'ctx-heading';
+        heading.textContent = item.label;
+        menu.appendChild(heading);
+        continue;
+      }
       const row = document.createElement('button');
       row.textContent = item.label;
+      if (item.checked !== undefined) {
+        row.classList.add('ctx-check');
+        row.setAttribute('role', 'menuitemradio');
+        row.setAttribute('aria-checked', String(item.checked));
+      }
+      const action = item.action;
       row.addEventListener('click', () => {
         menu.remove();
-        item.action();
+        action?.();
       });
       menu.appendChild(row);
     }
@@ -814,6 +883,7 @@ export class SlideRail {
   private bindKeys(): void {
     this.host.tabIndex = 0;
     this.host.addEventListener('keydown', (e) => {
+      if (this.readOnly && (e.key === 'Enter' || e.key === 'Backspace' || e.key === 'Delete')) return;
       if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.altKey && !e.ctrlKey && !e.metaKey) {
         const { slideIndex, deck } = this.store.get();
         if (!this.hasChildren(slideIndex)) return;
@@ -823,7 +893,7 @@ export class SlideRail {
         if ((e.key === 'ArrowLeft') !== collapsed) this.toggleGroup(slideIndex);
         return;
       }
-      if (e.key === 'Tab' && !e.altKey && !e.ctrlKey && !e.metaKey
+      if (!this.readOnly && e.key === 'Tab' && !e.altKey && !e.ctrlKey && !e.metaKey
         && (e.target === this.host || (e.target as HTMLElement).matches('.rail-item[data-index]'))) {
         e.preventDefault();
         e.stopPropagation();
@@ -844,7 +914,7 @@ export class SlideRail {
         // cannot also delete a selected canvas object.
         e.preventDefault();
         e.stopPropagation();
-        this.deleteSlide();
+        void this.deleteSlidesFromKeyboard();
         return;
       }
       if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
@@ -951,33 +1021,53 @@ export class SlideRail {
     });
   }
 
-  /** Open the comments popover for a slide; edits commit like any other. */
-  private openComments(slideId: string, index: number, anchor: DOMRect): void {
-    const current = () =>
-      this.store.get().deck.slides.find((s) => s.id === slideId)?.comments ?? [];
-    const mutate = (label: string, fn: (slide: Slide) => void) => {
-      this.store.commit((deck) => {
-        const slide = deck.slides.find((s) => s.id === slideId);
-        if (slide) fn(slide);
-      }, { label });
-      pop.refresh(current());
-    };
-    const pop = openCommentsPopover({
+  /**
+   * Highlight a row whose slide, or anything on it, carries an open comment
+   * thread, with the count in its corner. Rows are reused when only comments
+   * changed (`sameSlideDrawing`), so this runs on every render.
+   */
+  private syncCommentState(item: HTMLElement, slide: Slide): void {
+    const open = openThreadCount(slide.comments)
+      + slide.elements.reduce((sum, element) => sum + openThreadCount(element.comments), 0);
+    item.classList.toggle('has-comments', open > 0);
+    let chip = item.querySelector<HTMLElement>(':scope > .rail-comment-count');
+    if (open === 0) {
+      chip?.remove();
+      return;
+    }
+    if (!chip) {
+      chip = document.createElement('span');
+      chip.className = 'rail-comment-count';
+      item.appendChild(chip);
+    }
+    chip.textContent = String(open);
+    chip.title = `${open} open comment thread${open === 1 ? '' : 's'} on this slide. Right-click to read them.`;
+  }
+
+  /** Every thread on a slide, beside its row. */
+  private openComments(slideId: string, anchor: DOMRect, compose: boolean): void {
+    openComments({
+      store: this.store,
+      slideId,
       anchor,
-      title: `Comments — slide ${index + 1}`,
-      comments: current(),
-      onAdd: (text) => mutate('Add comment', (slide) => {
-        (slide.comments ??= []).push(newComment(text));
-      }),
-      onResolve: (id, resolved) => mutate(resolved ? 'Resolve comment' : 'Reopen comment', (slide) => {
-        const comment = slide.comments?.find((c) => c.id === id);
-        if (comment) comment.resolved = resolved;
-      }),
-      onDelete: (id) => mutate('Delete comment', (slide) => {
-        slide.comments = (slide.comments ?? []).filter((c) => c.id !== id);
-        if (slide.comments.length === 0) delete slide.comments;
-      }),
+      compose,
+      reveal: (target) => {
+        const index = this.store.get().deck.slides.findIndex((slide) => slide.id === target.slideId);
+        if (index < 0) return;
+        this.store.selectSlide(index);
+        if (target.elementId) this.store.select([target.elementId]);
+      },
     });
+  }
+
+  /** Give every selected slide `layout`, as the Props tab's Preset picker does. */
+  applyLayout(layout: SlideLayout, label: string): void {
+    const selected = this.store.get().slideSelection;
+    this.store.commit((deck) => {
+      for (const slide of deck.slides) {
+        if (selected.has(slide.id)) applySlideLayout(slide, layout, deck.layoutMasters);
+      }
+    }, { label: `Apply ${label} layout` });
   }
 
   addSlide(): void {
@@ -1072,11 +1162,12 @@ export class SlideRail {
    * selection covering the whole deck deletes all of it and lands on one
    * fresh blank slide, rather than silently refusing the keystroke.
    */
-  deleteSlide(): void {
+  deleteSlide(options: { ids?: ReadonlySet<string>; verb?: string } = {}): void {
     const { deck, slideIndex, slideSelection } = this.store.get();
+    const chosen = options.ids ?? slideSelection;
     const doomed = deck.slides
       .map((slide, index) => ({ slide, index }))
-      .filter(({ slide }) => slideSelection.has(slide.id));
+      .filter(({ slide }) => chosen.has(slide.id));
     if (doomed.length === 0) return;
     // Nothing to gain from swapping the last slide for another empty one.
     if (deck.slides.length === 1) return;
@@ -1099,6 +1190,47 @@ export class SlideRail {
       applyDeckThemeToNewSlide(d, 0);
     }, { label: doomed.length === 1 ? 'Delete slide' : `Delete ${doomed.length} slides` });
     this.store.selectSlide(wholeDeck ? 0 : Math.max(0, first - 1));
+    const numbers = slideNumbersLabel(doomed.map(({ index }) => index));
+    const one = doomed.length === 1;
+    this.onStatus?.(`${options.verb ?? 'Deleted'} slide${one ? '' : 's'} ${numbers}. `
+      + `Undo (${undoShortcutLabel()}) restores ${one ? 'it' : 'them'}.`);
+  }
+
+  /**
+   * Backspace/Delete with the rail focused. Focus stays on the rail after a
+   * thumbnail is clicked, so a deletion key meant for text lands here, and a
+   * multi-slide selection once vanished from a shared deck that way. More
+   * than one slide therefore asks first; a single slide goes at once, as it
+   * always has (and undo brings it back). The confirmation names exactly the
+   * slides selected when the key was pressed, so a remote edit while the
+   * dialog is open cannot widen what is deleted.
+   */
+  async deleteSlidesFromKeyboard(): Promise<void> {
+    if (this.confirmingDelete) return;
+    const { deck, slideSelection } = this.store.get();
+    const doomed = deck.slides
+      .map((slide, index) => ({ slide, index }))
+      .filter(({ slide }) => slideSelection.has(slide.id));
+    if (doomed.length <= 1) {
+      this.deleteSlide();
+      return;
+    }
+    const ids = new Set(doomed.map(({ slide }) => slide.id));
+    const count = doomed.length;
+    const numbers = slideNumbersLabel(doomed.map(({ index }) => index));
+    this.confirmingDelete = true;
+    try {
+      const confirmed = await showConfirmDialog({
+        title: `Delete ${count} slides?`,
+        description: `Slides ${numbers} are selected. Undo (${undoShortcutLabel()}) brings them back.`,
+        confirmLabel: `Delete ${count} slides`,
+        destructive: true,
+        returnFocus: this.host,
+      });
+      if (confirmed) this.deleteSlide({ ids });
+    } finally {
+      this.confirmingDelete = false;
+    }
   }
 
   private syncDepth(item: HTMLElement, index: number): void {
@@ -1200,4 +1332,18 @@ function railButton(label: string, onClick: () => void): HTMLElement {
   b.textContent = label;
   b.addEventListener('click', onClick);
   return b;
+}
+
+/** The rail menu's comment row: a count when the slide has open threads. */
+function commentMenuItem(
+  slide: Slide,
+  anchor: () => DOMRect,
+  open: (anchor: DOMRect, compose: boolean) => void,
+): MenuItem {
+  const count = openThreadCount(slide.comments)
+    + slide.elements.reduce((sum, element) => sum + openThreadCount(element.comments), 0);
+  return {
+    label: count > 0 ? `Comments (${count})…` : 'Comment on slide…',
+    action: () => open(anchor(), count === 0),
+  };
 }
