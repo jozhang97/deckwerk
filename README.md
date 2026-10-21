@@ -178,7 +178,7 @@ In the desktop editor, choose **File → Import → YouTube video…**, paste a 
 Run `npm run setup:youtube` once in a development checkout to install the downloader into `.venv-youtube/`; run it again to update when YouTube changes. The downloader needs Node.js 22+ or Deno on PATH. Packaged desktop installs use a separately installed `yt-dlp` (with its EJS dependencies) and JavaScript runtime; the downloader is not bundled. `DECKWERK_YTDLP_PATH` can select a custom executable. Playback of already imported videos needs none of these tools or a network connection.
 
 
-Organize the slide list into a hierarchy by selecting thumbnails and pressing Tab to indent or Shift+Tab to outdent. Indenting a parent or dragging it to a new position carries its nested slides. The hierarchy is saved with the deck and supports undo/redo; indentation does not change presentation order.
+Organize the slide list into a hierarchy by selecting thumbnails and pressing Tab to indent or Shift+Tab to outdent. Indentation changes only the selected slides; select multiple slides to change their levels together. To outdent a parent, also select any children that would otherwise be left without an intermediate level. Dragging a parent to a new position still carries its nested slides. The hierarchy is saved with the deck and supports undo/redo; indentation does not change presentation order.
 
 Click the arrow beside a parent slide to collapse or expand its group in the sidebar (Left/Right arrows do the same when the parent is selected). Collapse is local to the current editor session and does not affect playback. Select a parent and choose Hide group or Show group to skip or restore it and all its nested slides during presentation; this is saved with the deck and supports undo.
 

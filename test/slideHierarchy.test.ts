@@ -24,12 +24,48 @@ describe('slide outline operations', () => {
     expect(slideDepths(remaining)).toEqual([0, 1, 0, 1, 0]);
   });
 
-  it('shifts whole subtrees once even when children are selected too', () => {
+  it('indents a parent to its children’s level without moving them', () => {
+    const branch = slides([0, 0, 1, 2, 1, 0]);
+    const children = structuredClone(branch.slice(2));
+    changeSlideDepth(branch, new Set(['s1']), 1);
+    expect(slideDepths(branch)).toEqual([0, 1, 1, 2, 1, 0]);
+    expect(branch.slice(2)).toEqual(children);
+    changeSlideDepth(branch, new Set(['s1']), -1);
+    expect(slideDepths(branch)).toEqual([0, 0, 1, 2, 1, 0]);
+  });
+
+  it('changes selected parents and children once, leaving unselected descendants alone', () => {
     const branch = slides([0, 0, 1, 2, 0]);
     changeSlideDepth(branch, new Set(['s1', 's2']), 1);
-    expect(slideDepths(branch)).toEqual([0, 1, 2, 3, 0]);
+    expect(slideDepths(branch)).toEqual([0, 1, 2, 2, 0]);
     changeSlideDepth(branch, new Set(['s1', 's2']), -1);
     expect(slideDepths(branch)).toEqual([0, 0, 1, 2, 0]);
+  });
+
+  it('changes every slide in a selected subtree in both directions', () => {
+    const branch = slides([0, 0, 1, 2, 0]);
+    const selected = new Set(['s1', 's2', 's3']);
+    changeSlideDepth(branch, selected, 1);
+    expect(slideDepths(branch)).toEqual([0, 1, 2, 3, 0]);
+    changeSlideDepth(branch, selected, -1);
+    expect(slideDepths(branch)).toEqual([0, 0, 1, 2, 0]);
+  });
+
+  it('changes disjoint selections without changing slides between them', () => {
+    const branch = slides([0, 0, 1, 0, 0, 1]);
+    changeSlideDepth(branch, new Set(['s1', 's4']), 1);
+    expect(slideDepths(branch)).toEqual([0, 1, 1, 0, 1, 1]);
+    changeSlideDepth(branch, new Set(['s1', 's4']), -1);
+    expect(slideDepths(branch)).toEqual([0, 0, 1, 0, 0, 1]);
+  });
+
+  it('does not outdent a parent if that would change an unselected child’s level', () => {
+    const branch = slides([0, 1, 2, 1]);
+    const before = structuredClone(branch);
+    changeSlideDepth(branch, new Set(['s1']), -1);
+    expect(branch).toEqual(before);
+    changeSlideDepth(branch, new Set(['s1', 's2']), -1);
+    expect(slideDepths(branch)).toEqual([0, 0, 1, 1]);
   });
 
   it('moves a parent and descendants together, after the target branch', () => {

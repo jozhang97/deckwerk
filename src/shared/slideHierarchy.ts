@@ -24,25 +24,28 @@ export function normalizeSlideDepths(slides: Slide[]): void {
   });
 }
 
-/** Selected parents carry their descendants; overlapping selections shift once. */
+/** Shift only selected slides, keeping unselected slides at their existing levels. */
 export function changeSlideDepth(slides: Slide[], selected: ReadonlySet<string>, delta: 1 | -1): void {
   const depths = slideDepths(slides);
   const next = [...depths];
-  for (let index = 0; index < slides.length; index += 1) {
+  // Indent from the start so selected siblings can share their new parent.
+  // Outdent from the end so selected children make room for their parents.
+  for (let index = delta === 1 ? 0 : slides.length - 1;
+    index >= 0 && index < slides.length; index += delta) {
     if (!selected.has(slides[index].id)) continue;
-    const end = subtreeEnd(depths, index);
     const allowed = delta === 1
       ? index > 0 && depths[index] < next[index - 1] + 1
-      : depths[index] > 0;
+      : depths[index] > 0 && (index + 1 === slides.length || next[index + 1] <= depths[index]);
     if (allowed) {
-      for (let child = index; child < end; child += 1) next[child] += delta;
+      next[index] += delta;
     }
-    index = end - 1;
   }
   if (next.every((depth, index) => depth === depths[index])) return;
   next.forEach((depth, index) => {
-    if (depth) slides[index].depth = depth;
-    else delete slides[index].depth;
+    if (depth !== depths[index]) {
+      if (depth) slides[index].depth = depth;
+      else delete slides[index].depth;
+    }
   });
 }
 

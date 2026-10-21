@@ -133,6 +133,40 @@ describe('slide hierarchy', () => {
     expect(store.get().deck.slides.map((slide) => slide.depth ?? 0)).toEqual([0, 0, 0]);
   });
 
+  it.each([
+    { selected: [1], expected: [0, 1, 1, 2, 0] },
+    { selected: [1, 2], expected: [0, 1, 2, 2, 0] },
+    { selected: [1, 2, 3], expected: [0, 1, 2, 3, 0] },
+    { selected: [1, 4], expected: [0, 1, 1, 2, 1] },
+  ])('Tab changes exactly the selected rows $selected with undo/redo', ({ selected, expected }) => {
+    const { host, store } = setup();
+    const original = [0, 0, 1, 2, 0];
+    store.commit(deck => {
+      deck.slides = original.map((depth, index) => ({
+        ...structuredClone(deck.slides[0]), id: `hierarchy-${index}`, depth,
+      }));
+    }, { history: false });
+    pickRow(host.querySelector<HTMLElement>(`[data-index="${selected[0]}"]`)!);
+    for (const index of selected.slice(1)) {
+      togglePickRow(host.querySelector<HTMLElement>(`[data-index="${index}"]`)!);
+    }
+    const history = store.history().length;
+    const levels = () => store.get().deck.slides.map(slide => slide.depth ?? 0);
+    tab(host);
+    expect(levels()).toEqual(expected);
+    expect(store.history()).toHaveLength(history + 1);
+    expect([...host.querySelectorAll<HTMLElement>('.rail-item[data-index]')]
+      .map(row => Number(row.dataset.depth))).toEqual(expected);
+    tab(host, true);
+    expect(levels()).toEqual(original);
+    store.undo();
+    expect(levels()).toEqual(expected);
+    store.undo();
+    expect(levels()).toEqual(original);
+    store.redo();
+    expect(levels()).toEqual(expected);
+  });
+
   it('adds and duplicates siblings after existing descendants', () => {
     const { store, rail } = setup();
     store.selectSlide(1);
