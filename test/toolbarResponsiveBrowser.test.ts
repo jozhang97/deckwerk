@@ -21,7 +21,7 @@ describe.skipIf(!electronBinary)('right sidebar toggle in the desktop editor', (
   it('expands the canvas, persists across reload, and restores the chosen panel and width', async () => {
     editor = await launchDesktopEditor('sidebar-text', '<p>Sidebar toggle</p>');
     const cdp = editor.cdp;
-    await cdp.click('#side-tabs [data-panel="history"]', 'History tab');
+    await cdp.click('#side-tabs [data-panel="timeline"]', 'Build tab');
     const width = () => cdp.evaluate<number>('document.getElementById("canvas").getBoundingClientRect().width');
     const initialWidth = await width();
     const sidebarWidth = await cdp.evaluate<number>('document.getElementById("side").getBoundingClientRect().width');
@@ -30,7 +30,7 @@ describe.skipIf(!electronBinary)('right sidebar toggle in the desktop editor', (
     expect(await cdp.evaluate<string>('getComputedStyle(document.querySelector(".panel-resize-side")).display')).toBe('none');
     await cdp.click('.sidebar-toggle', 'Show right sidebar');
     expect(await width()).toBe(initialWidth);
-    expect(await cdp.evaluate<boolean>('document.getElementById("history").hidden')).toBe(false);
+    expect(await cdp.evaluate<boolean>('document.getElementById("timeline").hidden')).toBe(false);
     await cdp.click('.sidebar-toggle', 'Hide before reload');
     await cdp.call('Page.reload');
     await eventually(() => cdp.evaluate<boolean>('!!document.querySelector(".sidebar-toggle")'), 'toolbar did not return');
@@ -98,25 +98,45 @@ describe.skipIf(!electronBinary)('responsive desktop toolbar', () => {
   }, async () => {
     editor = await launchDesktopEditor('toolbar-fixture', 'Toolbar fixture');
 
-    // PyMOL and the sidebar toggle join the upstream controls, so a medium
-    // window uses More to keep the insert and presentation groups apart.
-    const medium = await toolbarAt(900, (layout) => layout.fileVisible
-      && layout.classes.includes('toolbar-compact-secondary'));
+    // Exercise the combined upstream and fork controls at a medium width.
+    const insert = ['Text', 'Shape', 'Pen', 'Table', 'Media', 'PyMOL…'];
+    const medium = await toolbarAt(1200, (layout) => layout.fileVisible
+      && layout.leftRight <= layout.centerLeft && layout.centerRight <= layout.rightLeft);
     expect(medium.height).toBe(44);
     expect(medium.fileVisible).toBe(true);
-    expect(medium.moreVisible).toBe(true);
     expect(medium.leftRight).toBeLessThanOrEqual(medium.centerLeft);
     expect(medium.centerRight).toBeLessThanOrEqual(medium.rightLeft);
-    expect(medium.insertLabels).toEqual(expect.arrayContaining(['Text', 'Shape', 'Table']));
+    expect(medium.insertLabels).toEqual(expect.arrayContaining(insert));
     expect(medium.presentVisible).toBe(true);
 
+    // Narrower, Agent and Collaborate fold into More before Insert gives
+    // up any of its words. Where that happens depends on the platform's
+    // fonts, so walk the width down until it does.
+    const fits = (layout: ToolbarLayout) => layout.leftRight <= layout.centerLeft
+      && layout.centerRight <= layout.rightLeft;
+    let compact: ToolbarLayout | null = null;
+    for (let width = 1180; width >= 600 && !compact; width -= 20) {
+      const layout = await toolbarAt(width, fits);
+      if (layout.classes.includes('toolbar-compact-secondary')) compact = layout;
+    }
+    if (!compact) throw new Error('Agent and Collaborate never folded into More');
+    expect(compact.height).toBe(44);
+    expect(compact.classes).not.toContain('toolbar-compact-insert');
+    expect(compact.moreVisible).toBe(true);
+    expect(compact.leftRight).toBeLessThanOrEqual(compact.centerLeft);
+    expect(compact.centerRight).toBeLessThanOrEqual(compact.rightLeft);
+    expect(compact.insertLabels).toEqual(expect.arrayContaining(insert));
+    expect(compact.presentVisible).toBe(true);
+
+    // At the narrowest, Insert keeps its icons and drops its words.
     const narrow = await toolbarAt(500, (layout) => layout.classes.includes('toolbar-compact-file')
-      && layout.classes.includes('toolbar-compact-secondary'));
+      && layout.classes.includes('toolbar-compact-secondary')
+      && layout.classes.includes('toolbar-compact-insert'));
     expect(narrow.height).toBe(44);
     expect(narrow.moreVisible).toBe(true);
     expect(narrow.leftRight).toBeLessThanOrEqual(narrow.centerLeft);
     expect(narrow.centerRight).toBeLessThanOrEqual(narrow.rightLeft);
-    expect(narrow.insertLabels).toEqual(expect.arrayContaining(['Text', 'Shape', 'Table']));
+    expect(narrow.insertLabels).toEqual(expect.arrayContaining(insert));
     expect(narrow.presentVisible).toBe(true);
     expect(narrow.fileVisible).toBe(true);
   });

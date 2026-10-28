@@ -60,15 +60,24 @@ describe('interactive video controls', () => {
   it('leaves Space and arrows to focused video controls while Escape still exits', () => {
     const video = document.createElement('video'); video.controls = true; document.body.append(video);
     let next = 0, prev = 0, exits = 0;
+    const rates: string[] = [];
     const unbind = bindPresentKeys(window, {} as never, {
+      onVideoRate: (change) => { rates.push(change); },
       onNext: () => { next++; }, onPrev: () => { prev++; }, onExit: () => { exits++; },
     });
-    for (const key of [' ', 'ArrowRight', 'ArrowLeft']) {
+    for (const key of [' ', 'ArrowRight', 'ArrowLeft', '>', '<', ']', '[', '=']) {
       const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
       video.dispatchEvent(event);
       expect(event.defaultPrevented).toBe(false);
     }
     expect([next, prev]).toEqual([0, 0]);
+    expect(rates).toEqual([]);
+    for (const key of ['>', ']', '<', '[', '=']) {
+      const event = new KeyboardEvent('keydown', { key, cancelable: true });
+      window.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+    }
+    expect(rates).toEqual(['faster', 'faster', 'slower', 'slower', 'normal']);
     video.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     expect(exits).toBe(1);
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));

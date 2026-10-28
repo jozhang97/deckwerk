@@ -189,7 +189,33 @@ open to anyone who can reach the port. For a standing multi-user deployment
 npm run collab -- path/to/decks --host 127.0.0.1 --access you@example.com
 ```
 
-and front it with `tailscale serve` (e.g. `tailscale serve --bg --https=443
+and publish it on the tailnet in one of two ways.
+
+**Recommended: DeckWerk terminates TLS itself on the tailnet address.**
+
+```bash
+sudo tailscale cert --cert-file /srv/deckwerk/tls/cert.pem \
+  --key-file /srv/deckwerk/tls/key.pem <machine>.<tailnet>.ts.net
+npm run collab -- path/to/decks --host 127.0.0.1 --access you@example.com \
+  --tls-host <machine's 100.x.y.z> --tls-port 9443 \
+  --tls-cert /srv/deckwerk/tls/cert.pem --tls-key /srv/deckwerk/tls/key.pem
+```
+
+Each HTTPS connection's identity is tailscaled's `whois` for the peer
+address, asked over its LocalAPI socket (`--tailscale-socket`, default
+`/run/tailscale/tailscaled.sock`), which needs no privileges. It comes from
+the WireGuard key the connection arrived under, so identity headers a peer
+sends on this listener are ignored. Renew the certificate with the same
+`tailscale cert` command on a timer; the server re-reads the files within the
+hour. The loopback listener keeps working for the machine itself.
+
+Why not `tailscale serve`: it accepts connections in tailscaled's userspace
+TCP stack, which over a real round trip moves a fraction of what the tunnel
+carries. Measured on one lab server, the same laptop pulled 0.5–2 MB/s
+through serve and 14–17 MB/s over the kernel's TCP on the tailnet address;
+a deck's images and clips crossed the wire ten times slower than they had to.
+
+**Or** front it with `tailscale serve` (e.g. `tailscale serve --bg --https=443
 http://127.0.0.1:5800`). Identity comes from the `Tailscale-User-Login` /
 `Tailscale-User-Name` headers serve injects, trusted **only** on loopback
 sockets — so bind `127.0.0.1`; any other interface refuses all requests. A
@@ -381,7 +407,10 @@ the participant id.
 - **Present → Present in Speaker View** — opens the audience in a second
   browser window and turns this tab into Speaker View: current and next slide,
   build position, presentation and slide timers, wall clock, and
-  previous/blank/next/end. Move the audience window to the projector and press
+  previous/blank/next/end. **Slides** (or `O`) opens a scrollable thumbnail
+  rail beside the current slide; **All slides** (or `G`) opens a full grid.
+  Hidden slides appear dimmed and marked Hidden in both views, and clicking one
+  can show it directly. Move the audience window to the projector and press
   `F` there for fullscreen. The two surfaces are the same page in different
   roles, and they talk over a `BroadcastChannel` scoped to the deck rather than
   through the server — presenter commands stay private to the presenter and
@@ -392,6 +421,16 @@ the participant id.
   surface ends the show on both. Speaker View needs pop-ups allowed for the
   site; if the second window is refused, Present falls back to presenting in
   this tab and says why.
+- **Present with a second screen** (Chrome and Edge, through the Window
+  Management API) — when `screen.isExtended` says another screen is attached,
+  Present (plain or Speaker View) sends this tab's presentation fullscreen to
+  that screen as the audience and opens Speaker View in a pop-up filling the
+  screen the editor is on, from the one click, like the desktop app. Press `F`
+  in Speaker View to make it fullscreen too. The first time, the browser asks
+  to allow window management; if that takes longer than the click lasts,
+  nothing starts and the status line says to press Present again. Refused, no
+  API (Safari, Firefox) or one screen: Present behaves as described above. The
+  choice of screen is `src/renderer/collab/presentScreens.ts`.
 - **Sidebar tabs** — Props, Theme (the full preset gallery + adoption
   controls, shared code with the desktop app), Build, History. Restoring a
   history snapshot broadcasts as an ordinary transaction.

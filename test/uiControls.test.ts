@@ -2,7 +2,7 @@ import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePopover, helpButton, menuButton } from '../src/renderer/editor/ui.js';
+import { closePopover, helpButton, menuButton, openAnchoredPopover } from '../src/renderer/editor/ui.js';
 import {
   createToolbarPicker,
   createToolbarSplitButton,
@@ -25,6 +25,23 @@ describe('shared editor controls', () => {
     });
   });
   afterEach(() => closePopover());
+
+  it('positions a popover beside its panel and resets the anchor when closed', () => {
+    const anchor = document.createElement('button');
+    const panel = document.createElement('aside');
+    const popover = document.createElement('div');
+    document.body.append(panel, anchor);
+    anchor.getBoundingClientRect = () => ({ top: 50, bottom: 70, left: 800, right: 820, width: 20, height: 20 }) as DOMRect;
+    panel.getBoundingClientRect = () => ({ top: 0, bottom: 700, left: 800, right: 1000, width: 200, height: 700 }) as DOMRect;
+    popover.getBoundingClientRect = () => ({ top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100 }) as DOMRect;
+    openAnchoredPopover(anchor, popover, { beside: panel });
+    expect(popover.style.left).toBe('694px');
+    expect(popover.style.top).toBe('50px');
+    expect(anchor.getAttribute('aria-expanded')).toBe('true');
+    closePopover();
+    expect(popover.isConnected).toBe(false);
+    expect(anchor.getAttribute('aria-expanded')).toBe('false');
+  });
 
   it('makes help popovers keyboard discoverable and non-modal', () => {
     const help = helpButton({ title: 'Morph', description: 'Pairs objects.', firstAction: 'Select slides.' });
@@ -63,12 +80,13 @@ describe('shared editor controls', () => {
       .map((item) => `${item.textContent}:${item.getAttribute('aria-checked')}`);
 
     open();
-    expect(radios()).toEqual(['System:true', 'Light:false', 'Dark:false']);
+    const sizes = ['Small · 90%:false', 'Default · 100%:true', 'Large · 115%:false', 'Larger · 130%:false'];
+    expect(radios()).toEqual(['System:true', 'Light:false', 'Dark:false', ...sizes]);
     [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')]
       .find((item) => item.textContent === 'Light')!.click();
     expect(document.documentElement.dataset.uiTheme).toBe('light');
     open();
-    expect(radios()).toEqual(['System:false', 'Light:true', 'Dark:false']);
+    expect(radios()).toEqual(['System:false', 'Light:true', 'Dark:false', ...sizes]);
     localStorage.removeItem('deckwerk.uiTheme');
   });
 
@@ -90,8 +108,10 @@ describe('shared editor controls', () => {
       expect(source).toContain("barButton('Open'");
       expect(source).toContain("createToolbarPicker('Import…'");
       expect(source).toContain("label: 'Keynote…'");
-      expect(source).toContain("barIconButton('Text'");
+      expect(source).toContain('createTextInsertPicker({');
+      expect(source).not.toContain("barIconButton('Code'");
       expect(source).toContain('createShapeInsertPicker(store)');
+      expect(source).toContain('createPenButton(canvas)');
       expect(source).not.toContain("menuButton('File'");
       expect(source).not.toContain("menuButton('Insert'");
     }
@@ -212,7 +232,9 @@ describe('shared editor controls', () => {
     left.getBoundingClientRect = () => toolbar.classList.contains('toolbar-compact-file')
       ? rect(0, 120)
       : rect(0, toolbar.classList.contains('toolbar-hide-deck-name') ? 430 : 450);
-    center.getBoundingClientRect = () => deckControlsVisible ? rect(400, 220) : rect(0, 0);
+    center.getBoundingClientRect = () => deckControlsVisible
+      ? rect(400, toolbar.classList.contains('toolbar-compact-insert') ? 120 : 220)
+      : rect(0, 0);
     right.getBoundingClientRect = () => deckControlsVisible
       ? rect(660, toolbar.classList.contains('toolbar-compact-secondary') ? 100 : 240)
       : rect(0, 0);
@@ -225,6 +247,12 @@ describe('shared editor controls', () => {
     Object.defineProperty(toolbar, 'clientWidth', { configurable: true, value: 500 });
     refreshResponsiveToolbar(toolbar);
     expect(toolbar.classList.contains('toolbar-compact-secondary')).toBe(true);
+    expect(toolbar.classList.contains('toolbar-compact-insert')).toBe(false);
+
+    // Narrower still, Insert keeps its icons and drops its words.
+    Object.defineProperty(toolbar, 'clientWidth', { configurable: true, value: 420 });
+    refreshResponsiveToolbar(toolbar);
+    expect(toolbar.classList.contains('toolbar-compact-insert')).toBe(true);
 
     deckControlsVisible = false;
     refreshResponsiveToolbar(toolbar);

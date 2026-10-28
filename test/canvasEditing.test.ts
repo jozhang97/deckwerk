@@ -2732,8 +2732,8 @@ describe('native line endpoint editing', () => {
     const inspectorHost = document.createElement('aside');
     document.body.appendChild(inspectorHost);
     new Inspector(inspectorHost, store);
-    const arrowStyle = [...inspectorHost.querySelectorAll<HTMLElement>('.insp-group')]
-      .find((section) => section.querySelector('h4')?.textContent === 'Arrow style')!;
+    const arrowStyle = [...inspectorHost.querySelectorAll<HTMLElement>('.insp-option-section')]
+      .find((section) => section.querySelector('h4')?.textContent === 'Stroke')!;
     const widthField = [...arrowStyle.querySelectorAll<HTMLLabelElement>('label')]
       .find((label) => label.querySelector('span')?.textContent === 'WIDTH')!;
     const width = widthField.querySelector<HTMLInputElement>('input')!;
@@ -2826,18 +2826,21 @@ describe('same-kind multi-selection properties', () => {
     expect(optionSections.map((section) => section.querySelector('h4')?.textContent))
       .toEqual([
         'Playback',
+        'Compare',
         'Mask',
         'Border',
         'Effects',
       ]);
     expect(optionSections[0].querySelectorAll('.video-checkbox-grid > .field-check')).toHaveLength(4);
+    // Exactly two clips selected can be stacked as a before/after wipe.
+    expect(optionSections[1].textContent).toContain('Arrange as wipe');
     // Keep-aspect-ratio clips like the mask does, so it lives in that section.
-    expect(optionSections[1].textContent).toContain('Keep aspect ratio');
-    expect(optionSections[1].textContent).toContain('Corner radius');
-    expect(optionSections[1].textContent).toContain('Circular mask');
-    expect(optionSections[2].textContent).toContain('Color');
-    expect(optionSections[2].textContent).toContain('Width');
-    expect(optionSections[2].textContent).not.toContain('Corner radius');
+    expect(optionSections[2].textContent).toContain('Keep aspect ratio');
+    expect(optionSections[2].textContent).toContain('Corner radius');
+    expect(optionSections[2].textContent).toContain('Circular mask');
+    expect(optionSections[3].textContent).toContain('Color');
+    expect(optionSections[3].textContent).toContain('Width');
+    expect(optionSections[3].textContent).not.toContain('Corner radius');
     const autoplay = [...videoGroup.querySelectorAll<HTMLLabelElement>('label')]
       .find((label) => label.querySelector('span')?.textContent === 'Autoplay')!
       .querySelector<HTMLInputElement>('input')!;
@@ -3104,7 +3107,7 @@ describe('object creation and manipulation', () => {
     trigger.focus();
     trigger.click();
     const item = [...wrap.querySelectorAll<HTMLButtonElement>('.shape-menu-item')].find(
-      (el) => el.textContent === 'Curved arrow',
+      (el) => el.textContent === 'Arrow',
     )!;
     item.click();
 
@@ -3113,7 +3116,7 @@ describe('object creation and manipulation', () => {
     const [id] = [...store.get().selection];
     expect(store.slide!.elements.find((el) => el.id === id)).toMatchObject({
       shape: 'arrow',
-      control: expect.any(Object),
+      arrowEnd: true,
     });
     store.deleteSelection();
     expect(store.slide!.elements.some((el) => el.id === id)).toBe(false);
