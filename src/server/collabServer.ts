@@ -75,7 +75,25 @@ import { stripScriptsKeepingTimeline } from '../shared/htmlSafety.js';
 import { PLAYER_TYPE_CSS } from '../shared/playerTypeCss.js';
 import { authoringPageHtml, type TextOverflow } from '../shared/htmlMeasure.js';
 import { deckRevision } from '../main/agentRuntime.js';
-import { applyAgentTransaction, importGaps as importGapsOf, validateDeckIntegrity, type AgentOperation } from '../shared/agent.js';
+import { assetChecker } from '../main/agentDeck.js';
+import {
+  AGENT_HOST_TOKEN_HEADER,
+  newAgentHostToken,
+  removeAgentHostMarker,
+  writeAgentHostMarker,
+} from '../main/agentHost.js';
+import {
+  AGENT_PROTOCOL_VERSION,
+  AgentRequestSchema,
+  applyAgentTransaction,
+  authoredScene,
+  importGaps as importGapsOf,
+  validateDeckIntegrity,
+  type AgentContext,
+  type AgentOperation,
+  type AgentRequest,
+  type AgentResponse,
+} from '../shared/agent.js';
 import { NativeEditRequestSchema, applyNativeEdits, nativeEditContract } from '../shared/nativeEdits.js';
 import { type Comment, type Deck, type Slide, type SlideElement } from '../shared/deck.js';
 import { commentsAt, commentsOperation, findComment, threadEdits, threadIdOf } from '../shared/comments.js';
@@ -91,6 +109,13 @@ import { injectWebBridgeRuntime } from '../shared/webBridge.js';
 import { deckAssetListing, restoreTrashedAssets, trashDeckAssets } from './assetTrash.js';
 import { CLIPBOARD_ID, ClipboardStash } from './clipboardStash.js';
 import { checkWebPage } from '../cli/renderSlides.js';
+import { installTutorial } from '../main/tutorial.js';
+import {
+  FEATURES_FILE,
+  SERVER_TUTORIAL_DECK_ID,
+  TUTORIAL_COPY_NAME,
+  type ServerTutorialInfo,
+} from '../shared/tutorial.js';
 import {
   canAccessDeck,
   canEditDeck,
@@ -366,6 +391,13 @@ export interface CollabServerOptions {
    * listener (`host`/`port`) stays as it is, for the machine itself.
    */
   tls?: CollabTlsOptions;
+  /**
+   * The shipped tutorial deck (`resources/tutorial`), to offer everyone a
+   * read-only copy of at `SERVER_TUTORIAL_DECK_ID` and a "Make my own copy"
+   * of it. Absent — every test and every hosted desktop session — means no
+   * tutorial at all. Ignored with `hostedDeckId`.
+   */
+  tutorialDir?: string;
 }
 
 export interface CollabTlsOptions {
@@ -398,6 +430,25 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
   const hostedDeckId = options.hostedDeckId;
   const agentMode = Boolean(options.agentMode);
   const localAgents = options.localAgents;
+  /**
+   * The shared tutorial: the shipped deck, rewritten at `<root>/~tutorial`
+   * whenever a new release ships a different one. It is read-only for
+   * everyone, the admin and agents included (`deckRoleOf`), never listed,
+   * and never moved, renamed, shared or trashed; a person who wants to try
+   * the steps makes their own copy (`/api/tutorial/copy`).
+   */
+  let tutorialSource: string | null = null;
+  if (options.tutorialDir && !hostedDeckId) {
+    try {
+      await installTutorial(options.tutorialDir, join(rootDir, SERVER_TUTORIAL_DECK_ID), { mode: 'replace' });
+      tutorialSource = resolve(options.tutorialDir);
+    } catch (error) {
+      console.warn(`  no tutorial: could not install ${options.tutorialDir}: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+  const tutorialInfo: ServerTutorialInfo | null = tutorialSource
+    ? { deckId: SERVER_TUTORIAL_DECK_ID, featuresPath: `/tutorial/${FEATURES_FILE}` }
+    : null;
   /**
    * The wire copy of oversized video. Deck assets are whatever the author
    * had — 26 Mbit/s screen recordings, 100 MB exports — and no amount of
@@ -692,6 +743,8 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     /** Present only with access control on. */
     owner?: string;
     visibility?: 'public' | 'private';
+    /** What `visibility: "public"` grants everyone else. */
+    publicRole?: 'edit' | 'view';
     canManage?: boolean;
     sharedWithMe?: boolean;
     role?: DeckRole;
@@ -781,6 +834,7 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       if (!role) return null;
       listed.owner = access.owner;
       listed.visibility = access.visibility;
+      listed.publicRole = access.publicRole;
       listed.canManage = canManageDeck(identity.login, access, accessControl);
       listed.sharedWithMe = access.sharedWith.some((share) => share.login === identity.login);
       listed.role = role;
@@ -820,6 +874,8 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       if (!entry.isDirectory()) continue;
       const childId = relative ? `${relative}/${entry.name}` : entry.name;
       const childDir = join(rootDir, childId);
+      // Offered by its own entry (`/api/tutorial`), not as somebody's deck.
+      if (childId === SERVER_TUTORIAL_DECK_ID) continue;
       if (isDeckDir(childDir)) {
         if (hostedDeckId && childId !== hostedDeckId) continue;
         const listed = await deckListEntry(childId, childDir, identity);
@@ -1058,6 +1114,10 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
 
   /** This identity's role on the deck, or null when it may not open it. */
   async function deckRoleOf(identity: Identity | null, deckId: string): Promise<DeckRole | null> {
+    // The shared tutorial is everyone's and nobody's to change: view-only
+    // here is what every write route, the WebSocket and the editor shell's
+    // redirect to the presentation page already honour.
+    if (deckId === SERVER_TUTORIAL_DECK_ID) return accessControl && !identity ? null : 'view';
     if (!accessControl) return 'owner';
     if (!identity) return null;
     let deckDir: string;
@@ -1263,16 +1323,16 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       announcedSrcs: new Set(),
     };
     session.watch({
-      onExternalDeck: (deck, seq) => broadcast(room, {
-        kind: 'deck',
+      // A change somebody wrote to deck.json, merged into the live deck: an
+      // ordinary transaction for every client, so an edit one has not had
+      // confirmed yet, or is still typing, survives it.
+      onExternalOps: (ops, seq, txnId, label) => broadcast(room, {
+        kind: 'txn',
         seq,
-        deck,
-        reason: options.agentMode ? 'agent-edit' : 'external-edit',
-        ...(options.agentMode
-          ? {
-              label: 'The Agent updated the deck through its file-based authoring workspace.',
-            }
-          : {}),
+        txnId,
+        byClientId: options.agentMode ? 'agent-http' : 'disk',
+        label: options.agentMode ? 'The Agent updated the deck through its file-based authoring workspace.' : label,
+        ops,
       }),
       onExternalTheme: (css) => broadcast(room, { kind: 'theme', css, byClientId: '' }),
     });
@@ -1560,6 +1620,224 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     }
     return browserProbe.problem;
   };
+
+  /**
+   * Compile an authoring page against a room's live deck and apply what it
+   * changed as one transaction: the bridge's save of an `edit/` page, and
+   * `slide-agent apply --html` on a deck this server hosts. `after` takes a
+   * slide id or a 1-based number, `0` meaning first; absent, new slides go
+   * last.
+   */
+  /**
+   * `slide-agent` on this machine, for a deck under this server's root
+   * (main/agentHost.ts): the agent request protocol the desktop editor
+   * answers through files, answered here against the live session, so an
+   * agent's change is a transaction like anybody's and never a deck.json
+   * written beside the server.
+   */
+  const agentHost = options.hostedDeckId ? null : { token: newAgentHostToken(), sessionId: randomUUID() };
+
+  /** What the agent sees of a hosted deck: the live deck and what its person has selected. */
+  function hostedAgentContext(room: Room): AgentContext {
+    const deck = room.session.deck;
+    // The person the agent works for: the admin when there is one, otherwise
+    // whoever joined last, among those who may edit.
+    const editors = [...room.peers.values()].filter((peer) => peer.canEdit && peer.greeted);
+    const owner = editors.find((peer) => accessControl && peer.identity?.login === accessControl.admin)
+      ?? editors.at(-1);
+    const slideIds = new Set(deck.slides.map((slide) => slide.id));
+    const selectedSlideIds = new Set((owner?.state.selectedSlideIds ?? []).filter((id) => slideIds.has(id)));
+    const selectedElementIds = new Set(owner?.state.selectedElementIds ?? []);
+    const activeSlideId = owner?.state.activeSlideId && slideIds.has(owner.state.activeSlideId)
+      ? owner.state.activeSlideId
+      : deck.slides[0]?.id ?? null;
+    return {
+      version: AGENT_PROTOCOL_VERSION,
+      live: true,
+      sessionId: agentHost?.sessionId ?? '',
+      pid: process.pid,
+      updatedAt: new Date().toISOString(),
+      deckPath: room.session.dir,
+      deckRevision: deckRevision(deck),
+      activeSlideId,
+      activeSlideIndex: Math.max(0, deck.slides.findIndex((slide) => slide.id === activeSlideId)),
+      selectedSlideIds: [...selectedSlideIds],
+      selectedElementIds: [...selectedElementIds],
+      scenes: deck.slides.map((slide, index) =>
+        authoredScene(deck, slide, index, selectedSlideIds, selectedElementIds, activeSlideId)),
+    };
+  }
+
+  async function answerAgentRequest(deckId: string, agentRequest: AgentRequest, identity: Identity | null): Promise<AgentResponse> {
+    const room = await getRoom(deckId);
+    const reply = { version: AGENT_PROTOCOL_VERSION, id: agentRequest.id };
+    const author = httpAuthor(identity, { name: 'slide-agent' });
+    if (agentRequest.kind === 'dom') {
+      return {
+        ...reply, status: 'error', revision: deckRevision(room.session.deck),
+        message: 'The live DOM is only available in the desktop editor. Use plain inspect, or render a PNG.',
+      };
+    }
+    if (agentRequest.kind === 'htmlSync') {
+      const synced = await syncPageIntoRoom(deckId, agentRequest.contents, {
+        after: agentRequest.after === undefined ? undefined : agentRequest.after ?? '0',
+        label: agentRequest.label,
+        agentSession: null,
+        identity,
+        author,
+      });
+      if (synced.status !== 200) {
+        return {
+          ...reply, status: synced.status === 409 ? 'conflict' : 'error', revision: deckRevision(room.session.deck),
+          message: String(synced.body.error ?? 'the page could not be applied'),
+        };
+      }
+      return { ...reply, status: 'applied', revision: String(synced.body.revision), payload: synced.body };
+    }
+    const current = deckRevision(room.session.deck);
+    if (agentRequest.transaction.expectedRevision !== current) {
+      return {
+        ...reply, status: 'conflict', revision: current,
+        message: 'The deck changed since that revision was read; re-read it and try again.',
+      };
+    }
+    try {
+      // Strict first, as the editor does; the session applies the same
+      // operations leniently, and every client replays them.
+      const next = applyAgentTransaction(room.session.deck, agentRequest.transaction);
+      const errors = validateDeckIntegrity(next, await assetChecker(room.session.dir));
+      if (errors.length > 0) throw new Error(errors.join('\n'));
+    } catch (error) {
+      return { ...reply, status: 'error', revision: current, message: error instanceof Error ? error.message : String(error) };
+    }
+    const label = agentRequest.transaction.label.trim().slice(0, 200) || 'Agent edit';
+    const ops = agentRequest.transaction.operations;
+    const txnId = `agent-host-${randomUUID()}`;
+    const applied = room.session.applyOps(ops, { label, txnId, author });
+    broadcast(room, { kind: 'txn', seq: applied.seq, txnId, byClientId: 'agent-http', label, ops });
+    if (applied.skipped.length > 0) {
+      return {
+        ...reply, status: 'error', revision: deckRevision(applied.deck),
+        message: `Applied, but ${applied.skipped.length} operation(s) were skipped: ${applied.skipped.map((skip) => skip.reason).join('; ')}`,
+      };
+    }
+    return { ...reply, status: 'applied', revision: deckRevision(applied.deck) };
+  }
+
+  async function syncPageIntoRoom(
+    deckId: string,
+    html: string,
+    options: {
+      after?: string;
+      label?: string;
+      agentSession: string | null;
+      identity: Identity | null;
+      /** Who the change is attributed to; the bridge's agent by default. */
+      author?: EditAuthor;
+    },
+  ): Promise<{ status: number; body: Record<string, unknown> }> {
+    const result = (status: number, body: Record<string, unknown>) => ({ status, body });
+    const startedAt = Date.now();
+    const room = await getRoom(deckId);
+    const deck = room.session.deck;
+    const scope = htmlSlideScope(html);
+    // New slides go last unless `--after` names a slide (id or 1-based
+    // number); `--after 0` puts them first.
+    const afterRef = options.after?.trim();
+    let after: string | null = deck.slides.at(-1)?.id ?? null;
+    if (afterRef) {
+      const anchor = insertionAnchor(deck, afterRef);
+      if (anchor === undefined) return result(404, { error: `no slide ${afterRef}` });
+      after = anchor;
+    }
+    const target: HttpHtmlDraft['target'] = scope
+      ? { mode: 'replace', slideIds: scope }
+      : { mode: 'insert', afterSlideId: after };
+    const compiledDraft = await compileHtmlDraft(deckId, room, html, target, options.agentSession, startedAt);
+    if ('error' in compiledDraft) return result(400, { error: compiledDraft.error });
+    // People keep editing while a page compiles, and that is fine: the
+    // browser's layout depends only on the page, the theme and the canvas.
+    // What does depend on the rest of the deck — the ids new slides and
+    // objects are minted, the layout masters — is worked out again below
+    // against the deck as it is now, with nothing awaited between that and
+    // the apply. Answering 409 instead (and only for edits that happened to
+    // land after the compile) made a busy session drop an agent's saves.
+    const themeNow = await loadTheme(room.session.dir, room.session.deck.theme);
+    const live = room.session.deck;
+    if (themeNow !== compiledDraft.compiled.theme
+      || live.canvas.w !== deck.canvas.w || live.canvas.h !== deck.canvas.h) {
+      return result(409, {
+        error: 'the theme or the canvas changed while this page compiled, so its layout is stale; save it again',
+      });
+    }
+    if (afterRef) {
+      const anchor = insertionAnchor(live, afterRef);
+      if (anchor === undefined) return result(404, { error: `no slide ${afterRef}` });
+      after = anchor;
+    } else {
+      after = live.slides.at(-1)?.id ?? null;
+    }
+    // Review state the page cannot carry (notes, skip, comments, non-appear
+    // builds) and dropping replacements that change nothing are both
+    // htmlSyncOperations' job, shared with the desktop editor and the CLI.
+    let operations: AgentOperation[];
+    try {
+      compiledDraft.draft.slides = slidesFromMeasured(live, compiledDraft.compiled.measured);
+      compiledDraft.draft.revision = deckRevision(live);
+      operations = htmlSyncOperations(live, compiledDraft.draft.slides, scope, after,
+        pageBases(compiledDraft.compiled.measured));
+    } catch (error) {
+      return result(400, { error: String(error instanceof Error ? error.message : error) });
+    }
+    const label = options.label?.trim().slice(0, 200)
+      || htmlChangeLabel(html)
+      || htmlSyncHistoryLabel(operations);
+    const changes = htmlSyncSummary(operations);
+    let revision = compiledDraft.draft.revision;
+    if (operations.length > 0) {
+      // Strict validation first, as the editor does before its lenient replay.
+      try {
+        applyAgentTransaction(room.session.deck, { version: 1, expectedRevision: revision, label, operations });
+      } catch (error) {
+        return result(400, { error: String(error instanceof Error ? error.message : error) });
+      }
+      const bridge = options.agentSession ? localAgents?.linked(room.session.dir, options.agentSession) ?? null : null;
+      const txnId = `agent-sync-${randomUUID()}`;
+      const applied = room.session.applyOps(operations, {
+        label, txnId, author: options.author ?? httpAuthor(options.identity, agentAuthor(bridge, options.agentSession)),
+      });
+      revision = deckRevision(applied.deck);
+      broadcast(room, {
+        kind: 'txn', seq: applied.seq, txnId,
+        byClientId: bridge && bridge.clientId !== 'http' ? bridge.clientId : 'agent-http',
+        label, ops: operations,
+        agentChatId: agentChatId(deckId, options.agentSession) ?? undefined,
+      });
+    }
+    return result(200, {
+      status: 'applied',
+      applied: operations.length > 0,
+      revision,
+      changes,
+      slides: compiledDraft.draft.slides.map((slide) => ({
+        id: slide.id,
+        elements: slide.elements.map((element) => ({
+          id: element.id, type: element.type,
+          box: { x: element.x, y: element.y, w: element.w, h: element.h },
+        })),
+      })),
+      overflows: compiledDraft.draft.report.overflows ?? [],
+      // What the page now says its slides are, for the bridge to stamp into
+      // it: the next save of the same page is compared with this.
+      stamp: pageStampOf(compiledDraft.draft.slides),
+      ...(Array.isArray(compiledDraft.draft.report.warnings) && (compiledDraft.draft.report.warnings as unknown[]).length > 0
+        ? { warnings: compiledDraft.draft.report.warnings }
+        : {}),
+      draftId: compiledDraft.draft.id,
+    });
+
+  }
+
 
   /**
    * Compile authored HTML the way every HTML route does — sanitised, measured
@@ -1956,6 +2234,26 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       return;
     }
 
+    if (path.startsWith('/api/agent-host/')) {
+      if (!agentHost || request.headers[AGENT_HOST_TOKEN_HEADER] !== agentHost.token) {
+        return respondJson(response, 403, { error: 'this route needs the token in the server\'s .deckwerk-server.json' });
+      }
+      if (!deckParam) return respondJson(response, 400, { error: 'missing deck' });
+      if (path === '/api/agent-host/context' && request.method === 'GET') {
+        return respondJson(response, 200, hostedAgentContext(await getRoom(deckParam)));
+      }
+      if (path === '/api/agent-host/request' && request.method === 'POST') {
+        let agentRequest: AgentRequest;
+        try {
+          agentRequest = AgentRequestSchema.parse(renameRetiredFields(JSON.parse((await readBody(request)).toString('utf8'))));
+        } catch (error) {
+          return respondJson(response, 400, { error: `not an agent request: ${error instanceof Error ? error.message : String(error)}` });
+        }
+        return respondJson(response, 200, await answerAgentRequest(deckParam, agentRequest, identity));
+      }
+      return respondJson(response, 404, { error: 'not found' });
+    }
+
     // The feature cookbook: every editor capability with a minimal, valid
     // example element. The antidote to agents hand-building what already
     // exists (literal "•" bullets instead of <ul>, equations out of positioned
@@ -1996,8 +2294,73 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
           mode: 'local',
         } : null,
         urls: boundPort === null ? [] : reachableUrls(host, boundPort),
+        tutorial: tutorialInfo,
       });
       return;
+    }
+
+    // The shared tutorial: where it is, the feature reference agents read
+    // (askAgentPrompt points them here), and a copy of one's own to try it in.
+    if (path === '/api/tutorial' && request.method === 'GET') {
+      if (!tutorialInfo) return respondJson(response, 404, { error: 'this server has no tutorial' });
+      return respondJson(response, 200, tutorialInfo);
+    }
+    if (tutorialInfo && path === tutorialInfo.featuresPath && request.method === 'GET') {
+      let text: string;
+      try {
+        text = await readFile(join(tutorialSource!, FEATURES_FILE), 'utf8');
+      } catch {
+        return respondJson(response, 404, { error: 'no feature reference' });
+      }
+      response.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'no-cache' });
+      response.end(text);
+      return;
+    }
+    if (path === '/api/tutorial/copy' && request.method === 'POST') {
+      if (!tutorialSource) return respondJson(response, 404, { error: 'this server has no tutorial' });
+      const folder = sanitizeFolderPath(url.searchParams.get('folder') ?? '');
+      if (folder === null) return respondJson(response, 400, { error: 'invalid folder' });
+      if (folder !== '' && (!(await folderVisible(identity, folder)) || isDeckDir(folderDirOf(folder)))) {
+        return respondJson(response, 404, { error: 'no such folder' });
+      }
+      // "DeckWerk tutorial", then "DeckWerk tutorial 2", … — claimed with a
+      // non-recursive mkdir, so two people copying at once get two decks.
+      let id: string | null = null;
+      let name = TUTORIAL_COPY_NAME;
+      let dir = '';
+      for (let n = 1; n <= 200 && !id; n++) {
+        name = n === 1 ? TUTORIAL_COPY_NAME : `${TUTORIAL_COPY_NAME} ${n}`;
+        const candidate = folder ? `${folder}/${name}` : name;
+        try {
+          dir = deckDirOf(candidate);
+        } catch {
+          return respondJson(response, 400, { error: 'the copy would not fit in that folder' });
+        }
+        if (existsSync(dir)) continue;
+        try {
+          await mkdir(dir);
+          id = candidate;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+      }
+      if (!id) return respondJson(response, 409, { error: 'too many copies of the tutorial in that folder' });
+      try {
+        await installTutorial(tutorialSource, dir);
+        const deck = await loadDeck(dir);
+        // The picker shows a deck's title and its folder name as one name.
+        if (deck.title !== name) await saveDeck(dir, { ...deck, title: name });
+      } catch (error) {
+        await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+        return respondJson(response, 500, { error: `could not copy the tutorial: ${error instanceof Error ? error.message : error}` });
+      }
+      // Private to whoever made it, like any new deck.
+      if (accessControl && identity) {
+        await writeDeckAccess(dir, {
+          owner: identity.login, visibility: 'private', sharedWith: [], publicRole: 'edit',
+        });
+      }
+      return respondJson(response, 200, { id, title: name });
     }
 
     // Removed authoring surface. Agents use slide-agent against a local deck
@@ -2259,6 +2622,9 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     if (path === '/api/trash' && request.method === 'POST') {
       const target = url.searchParams.get('path') ?? '';
       if (!splitDeckPath(target)) return respondJson(response, 400, { error: 'missing or invalid path' });
+      if (target === SERVER_TUTORIAL_DECK_ID) {
+        return respondJson(response, 403, { error: 'the tutorial is part of DeckWerk and cannot be deleted' });
+      }
       let dir: string;
       try {
         dir = folderDirOf(target);
@@ -3142,107 +3508,15 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     if (path === '/api/agent-mirror/sync-html' && request.method === 'POST') {
       if (!localAgents) return respondJson(response, 404, { error: 'local agents are not enabled' });
       if (!deckParam) return respondJson(response, 400, { error: 'missing deck' });
-      const startedAt = Date.now();
       const html = (await readBody(request)).toString('utf8');
       if (!html.trim()) return respondJson(response, 400, { error: 'missing html' });
-      const room = await getRoom(deckParam);
-      const deck = room.session.deck;
-      const scope = htmlSlideScope(html);
-      // New slides go last unless `--after` names a slide (id or 1-based
-      // number); `--after 0` puts them first.
-      const afterRef = url.searchParams.get('after')?.trim();
-      let after: string | null = deck.slides.at(-1)?.id ?? null;
-      if (afterRef) {
-        const anchor = insertionAnchor(deck, afterRef);
-        if (anchor === undefined) return respondJson(response, 404, { error: `no slide ${afterRef}` });
-        after = anchor;
-      }
-      const target: HttpHtmlDraft['target'] = scope
-        ? { mode: 'replace', slideIds: scope }
-        : { mode: 'insert', afterSlideId: after };
-      const compiledDraft = await compileHtmlDraft(deckParam, room, html, target, agentSessionParam, startedAt);
-      if ('error' in compiledDraft) return respondJson(response, 400, { error: compiledDraft.error });
-      // People keep editing while a page compiles, and that is fine: the
-      // browser's layout depends only on the page, the theme and the canvas.
-      // What does depend on the rest of the deck — the ids new slides and
-      // objects are minted, the layout masters — is worked out again below
-      // against the deck as it is now, with nothing awaited between that and
-      // the apply. Answering 409 instead (and only for edits that happened to
-      // land after the compile) made a busy session drop an agent's saves.
-      const themeNow = await loadTheme(room.session.dir, room.session.deck.theme);
-      const live = room.session.deck;
-      if (themeNow !== compiledDraft.compiled.theme
-        || live.canvas.w !== deck.canvas.w || live.canvas.h !== deck.canvas.h) {
-        return respondJson(response, 409, {
-          error: 'the theme or the canvas changed while this page compiled, so its layout is stale; save it again',
-        });
-      }
-      if (afterRef) {
-        const anchor = insertionAnchor(live, afterRef);
-        if (anchor === undefined) return respondJson(response, 404, { error: `no slide ${afterRef}` });
-        after = anchor;
-      } else {
-        after = live.slides.at(-1)?.id ?? null;
-      }
-      // Review state the page cannot carry (notes, skip, comments, non-appear
-      // builds) and dropping replacements that change nothing are both
-      // htmlSyncOperations' job, shared with the desktop editor and the CLI.
-      let operations: AgentOperation[];
-      try {
-        compiledDraft.draft.slides = slidesFromMeasured(live, compiledDraft.compiled.measured);
-        compiledDraft.draft.revision = deckRevision(live);
-        operations = htmlSyncOperations(live, compiledDraft.draft.slides, scope, after,
-          pageBases(compiledDraft.compiled.measured));
-      } catch (error) {
-        return respondJson(response, 400, { error: String(error instanceof Error ? error.message : error) });
-      }
-      const label = url.searchParams.get('label')?.trim().slice(0, 200)
-        || htmlChangeLabel(html)
-        || htmlSyncHistoryLabel(operations);
-      const changes = htmlSyncSummary(operations);
-      let revision = compiledDraft.draft.revision;
-      if (operations.length > 0) {
-        // Strict validation first, as the editor does before its lenient replay.
-        try {
-          applyAgentTransaction(room.session.deck, { version: 1, expectedRevision: revision, label, operations });
-        } catch (error) {
-          return respondJson(response, 400, { error: String(error instanceof Error ? error.message : error) });
-        }
-        const bridge = agentSessionParam ? localAgents.linked(room.session.dir, agentSessionParam) : null;
-        const txnId = `agent-sync-${randomUUID()}`;
-        const applied = room.session.applyOps(operations, {
-          label, txnId, author: httpAuthor(identity, agentAuthor(bridge, agentSessionParam)),
-        });
-        revision = deckRevision(applied.deck);
-        broadcast(room, {
-          kind: 'txn', seq: applied.seq, txnId,
-          byClientId: bridge && bridge.clientId !== 'http' ? bridge.clientId : 'agent-http',
-          label, ops: operations,
-          agentChatId: agentChatId(deckParam, agentSessionParam) ?? undefined,
-        });
-      }
-      respondJson(response, 200, {
-        status: 'applied',
-        applied: operations.length > 0,
-        revision,
-        changes,
-        slides: compiledDraft.draft.slides.map((slide) => ({
-          id: slide.id,
-          elements: slide.elements.map((element) => ({
-            id: element.id, type: element.type,
-            box: { x: element.x, y: element.y, w: element.w, h: element.h },
-          })),
-        })),
-        overflows: compiledDraft.draft.report.overflows ?? [],
-        // What the page now says its slides are, for the bridge to stamp into
-        // it: the next save of the same page is compared with this.
-        stamp: pageStampOf(compiledDraft.draft.slides),
-        ...(Array.isArray(compiledDraft.draft.report.warnings) && (compiledDraft.draft.report.warnings as unknown[]).length > 0
-          ? { warnings: compiledDraft.draft.report.warnings }
-          : {}),
-        draftId: compiledDraft.draft.id,
+      const synced = await syncPageIntoRoom(deckParam, html, {
+        after: url.searchParams.get('after') ?? undefined,
+        label: url.searchParams.get('label') ?? undefined,
+        agentSession: agentSessionParam,
+        identity,
       });
-      return;
+      return respondJson(response, synced.status, synced.body);
     }
 
     if (path === '/api/agent-mirror/file' && (request.method === 'GET' || request.method === 'PUT')) {
@@ -3270,16 +3544,30 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       if (!relative.startsWith('assets/')) {
         return respondJson(response, 400, { error: 'only files under assets/ can be uploaded' });
       }
-      const body = await readBody(request);
-      if (existsSync(absolute)) {
-        const current = await readFile(absolute);
-        if (current.equals(body)) return respondJson(response, 200, { path: relative, status: 'unchanged' });
-        return respondJson(response, 409, { error: `${relative} already exists with different content` });
-      }
+      // Streamed to disk, never buffered (as /api/upload is): a desktop
+      // putting a whole talk on the server sends its clips several at a time,
+      // each hundreds of megabytes. The file lands beside its destination
+      // under a dot-name, which no listing, mirror or download ever shows,
+      // and takes its real name only once it is whole.
       await mkdir(dirname(absolute), { recursive: true });
-      const temporary = `${absolute}.${randomUUID()}.tmp`;
-      await writeFile(temporary, body);
-      await rename(temporary, absolute);
+      const temporary = join(dirname(absolute), `.upload-${randomUUID()}.tmp`);
+      const hash = createHash('sha256');
+      try {
+        await pipeline(request, async function* (source: AsyncIterable<Buffer>) {
+          for await (const chunk of source) {
+            hash.update(chunk);
+            yield chunk;
+          }
+        }, createWriteStream(temporary));
+        if (existsSync(absolute)) {
+          const same = (await sha256OfFile(absolute)) === hash.digest('hex');
+          if (same) return respondJson(response, 200, { path: relative, status: 'unchanged' });
+          return respondJson(response, 409, { error: `${relative} already exists with different content` });
+        }
+        await rename(temporary, absolute);
+      } finally {
+        await rm(temporary, { force: true });
+      }
       prepareArrival(room.session.dir, relative);
       respondJson(response, 200, { path: relative, status: 'written' });
       return;
@@ -4092,6 +4380,11 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
         canComment = roleMayComment(role);
         if (userDirectory) void userDirectory.note(identity);
       }
+      // Read-only for everyone, with or without access control.
+      if (deckId === SERVER_TUTORIAL_DECK_ID) {
+        canEdit = false;
+        canComment = false;
+      }
       // A rename of this very deck may be landing right now; let it, then
       // look at what is on disk. A missing deck is answered here rather than
       // by getRoom's failure: a client that knew the old id is sent on to
@@ -4332,6 +4625,26 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
         case 'remote-end':
           endRemote(room, clientId, message.to);
           return;
+        case 'remote-request': {
+          // A person's own page asks; a presentation or an agent never does.
+          if (!peer.greeted || peer.agentFor || peer.state.agent || peer.state.presenting) return;
+          // One surface of one show: Speaker View and the audience are both
+          // presenting peers, and each would offer its own remote. Prefer the
+          // asker's own show (same login), then the most recent.
+          const shows = [...room.peers.entries()].filter(([id, other]) => id !== clientId && other.greeted && other.state.presenting);
+          const login = peer.identity?.login;
+          const [presenterId, presenter] = [...shows].reverse()
+            .find(([, other]) => login !== undefined && other.identity?.login === login) ?? shows.at(-1) ?? [];
+          if (!presenterId || !presenter) return;
+          send(presenter, {
+            kind: 'remote-request',
+            from: clientId,
+            name: peer.state.name,
+            ...(peer.state.device === 'phone' ? { device: 'phone' as const } : {}),
+            sameUser: Boolean(accessControl && login !== undefined && presenter.identity?.login === login),
+          });
+          return;
+        }
       }
     });
 
@@ -4369,6 +4682,24 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
   }
   unsubscribeSharedAgent = sharedAgent?.subscribe(emitSharedAgentState);
   void sweepMedia().catch(() => null);
+  // Announce this server to agents working in the folder it serves, at the
+  // address this machine reaches it on. A listener bound elsewhere is not
+  // reachable over loopback, and then there is nothing to announce.
+  const loopbackHost = host === '0.0.0.0' || host === '::' || host === '' || host === 'localhost'
+    ? '127.0.0.1'
+    : host === '127.0.0.1' || host === '::1' ? host : null;
+  const announced = agentHost && loopbackHost
+    ? await writeAgentHostMarker(rootDir, {
+      version: 1,
+      url: `http://${loopbackHost.includes(':') ? `[${loopbackHost}]` : loopbackHost}:${port}`,
+      token: agentHost.token,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+    }).then(() => true, (error: unknown) => {
+      console.error(`could not announce the server to agents: ${String(error)}`);
+      return false;
+    })
+    : false;
 
   return {
     port,
@@ -4429,6 +4760,7 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       for (const room of rooms.values()) await room.session.close();
       sharedAgent?.close();
       await userDirectory?.flush();
+      if (announced && agentHost) await removeAgentHostMarker(rootDir, agentHost.token).catch(() => undefined);
     },
   };
 }
@@ -5185,6 +5517,22 @@ const mirrorHashes = new Map<string, { size: number; mtimeMs: number; sha256: st
 
 export interface MirrorFileEntry { path: string; size: number; sha256: string }
 
+/** A file's content hash, read once per size and mtime. */
+async function sha256OfFile(absolute: string, known?: { size: number; mtimeMs: number }): Promise<string> {
+  const info = known ?? await stat(absolute);
+  const cached = mirrorHashes.get(absolute);
+  if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) return cached.sha256;
+  const sha256 = await new Promise<string>((resolvePromise, reject) => {
+    const hash = createHash('sha256');
+    createReadStream(absolute)
+      .on('data', (chunk) => hash.update(chunk))
+      .on('error', reject)
+      .on('end', () => resolvePromise(hash.digest('hex')));
+  });
+  mirrorHashes.set(absolute, { size: info.size, mtimeMs: info.mtimeMs, sha256 });
+  return sha256;
+}
+
 async function collectMirrorFiles(deckDir: string, themeFile: string): Promise<MirrorFileEntry[]> {
   // The mirror generates its own brief and helper; the deck's desktop-facing
   // AGENTS.md would send an agent looking for a CLI it does not have.
@@ -5203,21 +5551,7 @@ async function collectMirrorFiles(deckDir: string, themeFile: string): Promise<M
       else if (entry.isFile()) {
         const absolute = join(deckDir, relPath);
         const info = await stat(absolute);
-        const cached = mirrorHashes.get(absolute);
-        let sha256 = cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs
-          ? cached.sha256
-          : null;
-        if (!sha256) {
-          sha256 = await new Promise<string>((resolvePromise, reject) => {
-            const hash = createHash('sha256');
-            createReadStream(absolute)
-              .on('data', (chunk) => hash.update(chunk))
-              .on('error', reject)
-              .on('end', () => resolvePromise(hash.digest('hex')));
-          });
-          mirrorHashes.set(absolute, { size: info.size, mtimeMs: info.mtimeMs, sha256 });
-        }
-        files.push({ path: relPath, size: info.size, sha256 });
+        files.push({ path: relPath, size: info.size, sha256: await sha256OfFile(absolute, info) });
       }
     }
   }

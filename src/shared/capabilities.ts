@@ -243,6 +243,7 @@ export function capabilities(): Capability[] {
       when: 'Any result clip. This editor exists for this.',
       notes: [
         'start/end are seconds; end: null means the end of the file. Looping honours them.',
+        'playbackRate (data-playback-rate) plays the clip faster or slower: 2 is twice as fast, 0.5 half speed; leave it out for normal speed. start/end stay in the file’s own seconds. A sync group plays at its clock clip’s speed, so give every member the same one.',
         'autoplay/loop/muted default to true — a slide video normally plays itself. Set autoplay: false when a build starts it on a click instead.',
         'controls: true hands the audience a scrubber; normally leave it off.',
         'poster is a still shown before playback begins; null lets the first frame stand in.',
@@ -472,6 +473,7 @@ export function capabilities(): Capability[] {
         "{ type: 'pulse', target, term: '2' } enlarges that term for a moment (scale default 1.6, duration default 800 ms) and settles it back exactly; without term the whole object pulses. Any object can pulse. 'jiggle' (wobbles side to side, duration default 700 ms) and 'pop' (a smooth bump that eases up and back down, scale default 1.3, duration default 700 ms) take the same target and term. action.damping (0 to 1) sets how softly each moves — see builds.",
         'In authoring HTML, on the text element: data-term-build="click" (data-term-effect="color" data-term-color="#d9480f" data-term-duration="400" data-term="2" optional) and data-pulse="click" data-pulse-term="2" (data-pulse-scale="1.6" data-pulse-duration="800" data-pulse-damping="0.8" optional; data-pulse-lift="true" lifts a whole-object pulse); likewise data-jiggle="click" (data-jiggle-term, data-jiggle-duration, data-jiggle-damping) and data-pop="click" (data-pop-term, data-pop-scale, data-pop-duration, data-pop-damping). A page states the first build of each kind; the Build panel can add more.',
         'Jumping to a step, the presenter preview and PDF export show the finished state of each step; a pulse, a jiggle or a pop leaves no state behind.',
+        'A term build whose equation marks no terms, or that names a term the equation does not mark, does nothing on screen: apply warns, and validate lists it under buildProblems.',
       ],
       elements: [
         text('cap-eqb-title', 'Momentum balance, term by term', TITLE, { class: ['role-title'] }),

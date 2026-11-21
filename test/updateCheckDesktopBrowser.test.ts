@@ -40,7 +40,9 @@ afterEach(async () => {
   appProcess = null;
   await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
   server = null;
-  if (workDir) await rm(workDir, { recursive: true, force: true });
+  // Chromium's helper processes can still be writing the profile as the
+  // main process exits, which fails a one-shot rmdir with ENOTEMPTY.
+  if (workDir) await rm(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   workDir = '';
 });
 
@@ -85,9 +87,16 @@ const pressDialogButton = (label: string): string => `(() => {
   return true;
 })()`;
 
-/** Open the DeckWerk menu and choose an item, as a person would. */
+/**
+ * Open the DeckWerk menu and choose an item, as a person would. False until
+ * the toolbar is there: the updater answers as soon as the preload runs,
+ * before the editor has drawn its toolbar, and on a slow CI runner the menu
+ * button was not there yet to click.
+ */
 const chooseMenuItem = (label: string): string => `(() => {
-  document.querySelector('.brand-button').click();
+  const brand = document.querySelector('.brand-button');
+  if (!brand) return false;
+  brand.click();
   const item = [...document.querySelectorAll('.shape-menu .shape-menu-item')]
     .find((candidate) => candidate.textContent === ${JSON.stringify(label)});
   if (!item) {
@@ -147,7 +156,7 @@ describe.skipIf(!electronBinary)('checking for updates in the desktop app', () =
 
     // The menu, with nothing newer on the feed.
     await writeFile(join(feedDir, CHANNEL_FILE), manifest(current, 'The same release.'));
-    expect(await cdp.evaluate(chooseMenuItem('Check for Updates…'))).toBe(true);
+    await eventually(() => cdp.evaluate<boolean>(chooseMenuItem('Check for Updates…')), 'the DeckWerk menu never offered Check for Updates…');
     const latest = await eventually(
       () => cdp.evaluate<DialogState | null>(readDialog),
       'no answer to Check for Updates',
@@ -170,7 +179,7 @@ describe.skipIf(!electronBinary)('checking for updates in the desktop app', () =
       '99.0.0',
       '<h2>New</h2><p onclick="alert(1)">Faster <strong>video</strong></p><script>window.pwned = 1</script>',
     ));
-    expect(await cdp.evaluate(chooseMenuItem('Check for Updates…'))).toBe(true);
+    await eventually(() => cdp.evaluate<boolean>(chooseMenuItem('Check for Updates…')), 'the DeckWerk menu never offered Check for Updates…');
     const offer = await eventually(
       () => cdp.evaluate<DialogState | null>(readDialog),
       'the newer release was not offered',
@@ -210,7 +219,7 @@ describe.skipIf(!electronBinary)('checking for updates in the desktop app', () =
       'the editor never exposed the updater',
     );
     expect(state.mode).toEqual({ kind: 'none', reason: 'development' });
-    expect(await cdp.evaluate(chooseMenuItem('Check for Updates…'))).toBe(true);
+    await eventually(() => cdp.evaluate<boolean>(chooseMenuItem('Check for Updates…')), 'the DeckWerk menu never offered Check for Updates…');
     const dialog = await eventually(() => cdp.evaluate<DialogState | null>(readDialog), 'no answer in development');
     expect(dialog?.title).toBe('Updates are off in development');
     expect(await cdp.evaluate(pressDialogButton('OK'))).toBe(true);

@@ -62,7 +62,7 @@ import { DecodedVideoPool, releaseDecodedVideo } from '../player/decodedVideoPoo
 import { ungateVideoLoad } from '../player/mediaLoadGate.js';
 import { openSlideLinkInNewTab, slideLinkFromEvent } from '../player/links.js';
 import { expandTimeline } from '@shared/timeline.js';
-import { mapTextOffset, mergeTextHtml } from '@shared/textMerge.js';
+import { mergeTextHtml } from '@shared/textMerge.js';
 import {
   BASELINE_RUN_FONT_SIZE, isRelativeFontSize, restoreKatexSourceHtml,
   pastedHtmlHasMedia, sanitizePastedTextHtml, stripFittedFontSize, stripLayoutDeclarations,
@@ -132,6 +132,7 @@ import type { ImportedAsset } from '@shared/ipc.js';
 import { commentFocus, commentHighlightsShown, onCommentHighlightsChange, openComments } from './comments.js';
 import { openThreadCount } from '@shared/comments.js';
 import { reportRenderDivergences } from './renderInvariants.js';
+import { OffSlideText } from './offSlideText.js';
 import { SpellingSession } from './spellcheck.js';
 
 /** A row of the canvas right-click menu. */
@@ -143,6 +144,7 @@ import { isWebBridgeAction } from '@shared/webBridge.js';
 import { reportSelectionViolations } from './selectionInvariants.js';
 import { COMPARE_CHIP_CLASS, compareChip } from './compareChip.js';
 import { KeptSelectionHighlight, TEXT_EDIT_PANEL_CHROME } from './keptSelection.js';
+import { rangeForBookmark, textBookmark, type TextBookmark } from './caretPath.js';
 import { prepareCodeBlocks, syncCodeBody } from '../player/codeRender.js';
 import { CODE_EDIT_CHROME, CodeEditor } from './codeEditing.js';
 import { CODE_LINE_HEIGHT, CODE_PADDING_EM, describeLines, isLineBuild } from '@shared/codeBlocks.js';
@@ -158,6 +160,7 @@ import {
   spacingGuides,
 } from './snapping.js';
 import { sameSlideDrawing, type EditorStore } from './store.js';
+import { deleteTableRows, insertTableRow } from './tableRows.js';
 
 export type TableSelection = {
   elementId: string;
@@ -175,6 +178,8 @@ export type TableSelection = {
 type TableBorderEdge = 'top' | 'right' | 'bottom' | 'left';
 export type TableBorderPreset = 'none' | 'vertical' | 'horizontal';
 export type TableBorderSettings = { color: string; width: number; drawing: boolean };
+/** A block property the selected paragraphs share (null: none declares it), or mixed. */
+export type SelectionBlockValue = { mixed: boolean; value: number | null };
 
 /**
  * The editing surface: the slide rendered by the player, with an interaction
@@ -626,6 +631,19 @@ function leafTextBlocks(root: HTMLElement): HTMLElement[] {
 }
 
 /**
+ * What the selected paragraphs declare for one block property, NaN where a
+ * paragraph declares nothing. A paragraph spaced 2 beside one that follows
+ * the box is mixed, not "follows the box": reported as the latter, the field
+ * showed the 2 it computed at the caret, and typing 2 there changed nothing,
+ * so the plain paragraph never took it (nightly seed 20261031).
+ */
+function sharedBlockValue(values: number[]): SelectionBlockValue {
+  const declared = values.map((value) => (Number.isFinite(value) ? value : null));
+  const mixed = !declared.every((value) => value === declared[0]);
+  return { mixed, value: mixed ? null : declared[0] };
+}
+
+/**
  * Move a size the selection gave every character of a block onto the block.
  *
  * A line is as tall as the larger of its block's own font size (the "strut")
@@ -915,6 +933,8 @@ export class EditorCanvas {
   private stage: HTMLElement;
   private slideLayer: HTMLElement;
   private overlay: HTMLElement;
+  /** Off-slide text recoloured to read on the pasteboard; see offSlideText.ts. */
+  private offSlideText: OffSlideText;
   /** The comparison chip last drawn in the overlay (compareChip.ts). */
   private compareChipNode: HTMLElement | null = null;
   private zoomInput: HTMLInputElement;
@@ -1036,7 +1056,7 @@ export class EditorCanvas {
   /** Re-enter this edit after a rebuild that was forced mid-session. */
   private pendingEditReentry: {
     elementId: string;
-    offsets: { start: number; end: number } | null;
+    bookmark: TextBookmark | null;
   } | null = null;
   /**
    * What a discarded session reverts to: the session-start html, moved
@@ -1226,7 +1246,8 @@ export class EditorCanvas {
     this.slideLayer.className = 'slide-layer';
     this.overlay = document.createElement('div');
     this.overlay.className = 'overlay-layer';
-    this.stage.append(this.slideLayer, this.overlay);
+    this.offSlideText = new OffSlideText(this.slideLayer, this.host);
+    this.stage.append(this.slideLayer, this.offSlideText.layer, this.overlay);
     this.zoomControls = this.createZoomControls();
     this.zoomInput = this.zoomControls.querySelector<HTMLInputElement>('.zoom-value')!;
     this.host.replaceChildren(this.stage, this.zoomControls);
@@ -1398,7 +1419,7 @@ export class EditorCanvas {
     if (this.editingId) {
       this.pendingEditReentry = {
         elementId: this.editingId,
-        offsets: this.editingSelectionOffsets(),
+        bookmark: this.editingSelectionBookmark(),
       };
       if (this.finishTextEdit) this.finishTextEdit(true);
       else this.commitTextEdit();
@@ -1479,8 +1500,11 @@ export class EditorCanvas {
     const el = slide?.elements.find((candidate) => candidate.id === pending.elementId);
     if (!el || (el.type !== 'text' && el.type !== 'html')) return;
     this.beginTextEdit(pending.elementId);
-    if (this.editingId === pending.elementId && pending.offsets) {
-      this.restoreEditingSelection(pending.offsets);
+    if (this.editingId === pending.elementId && pending.bookmark) {
+      const body = this.slideLayer.querySelector<HTMLElement>(
+        `[data-element-id="${CSS.escape(pending.elementId)}"] .text-content`,
+      );
+      if (body) this.restoreTextBookmark(body, pending.bookmark);
     }
   }
 
@@ -1683,6 +1707,18 @@ export class EditorCanvas {
   }
 
   /**
+   * Draw the slide again from nothing. For files that arrived after the slide
+   * was drawn without them (a collaborator's new picture reaching this
+   * machine's copy of a server deck): an unchanged slide is otherwise never
+   * rebuilt, so its broken picture would stay broken.
+   */
+  forceRedraw(): void {
+    this.renderedSlide = null;
+    this.renderedSlideIndex = null;
+    this.render();
+  }
+
+  /**
    * Move paused clips onto the variant the server now names for them.
    *
    * A clip's streaming version can land while the canvas shows its original:
@@ -1826,7 +1862,12 @@ export class EditorCanvas {
    * the other person's words. Either way the caret is carried through the
    * change by what was inserted or removed before it, not left at the same
    * numeric offset, which dropped the next keystrokes into the middle of the
-   * other person's word.
+   * other person's word — and by the block it is in (caretPath.ts), so it
+   * stays in its own bullet, an empty one included.
+   *
+   * Html that differs from the sync point only in how it is spelled (this
+   * session's own push coming back normalised, a tool re-serialising the
+   * box) changes nothing here: the live DOM is not touched at all.
    */
   private adoptRemoteEditedHtml(
     el: SlideElement & { type: 'text' | 'html' },
@@ -1854,29 +1895,28 @@ export class EditorCanvas {
       this.textEditStoreBase = el.html;
       return;
     }
-    const remote = local === domBase ? null : editingFormOf(el.html);
+    const incoming = editingFormOf(el.html);
+    if (incoming === domBase || incoming === editingFormOf(this.textEditStoreBase)) {
+      // The same content in another spelling — this session's own commit
+      // echoed back through the server, normalised on the way. The live DOM
+      // and the caret in it already are that content: nothing to do.
+      this.textEditStoreBase = el.html;
+      return;
+    }
+    const remote = local === domBase ? null : incoming;
     const merged = remote === null ? null : mergeTextHtml(domBase, remote, local);
     if (merged !== local) {
+      // Carried by block and offset within it, not by one flat offset: a
+      // flat offset cannot tell an empty bullet from the end of the bullet
+      // above or the start of the one below, and the caret jumped there.
       const range = this.activeTextRange(body);
-      const offsets = range ? this.textOffsetsForRange(body, range) : null;
-      // Flat text offsets cannot tell the end of one paragraph from the start
-      // of the next; a caret that sat at the end of its text stays there.
-      const affinity = range?.collapsed && range.startContainer instanceof Text
-        && range.startOffset > 0 && range.startOffset === range.startContainer.data.length
-        ? 'backward' : 'forward';
-      const before = body.textContent ?? '';
+      const bookmark = range ? textBookmark(body, TEXT_BLOCKS, range) : null;
       // A peer can send legacy generated KaTeX just as the session can start
       // with it; keep the live editing surface in authored delimiter form.
       body.innerHTML = merged === null
         ? normalizeParagraphHtml(restoreKatexSourceHtml(el.html), true)
         : normalizeParagraphHtml(merged, true);
-      if (offsets) {
-        const after = body.textContent ?? '';
-        this.restoreTextRange(body, {
-          start: mapTextOffset(before, after, offsets.start),
-          end: mapTextOffset(before, after, offsets.end),
-        }, affinity);
-      }
+      if (bookmark) this.restoreTextBookmark(body, bookmark);
     }
     this.textEditStoreBase = el.html;
     if (remote === null) {
@@ -4575,6 +4615,16 @@ export class EditorCanvas {
     return this.textOffsetsForRange(body, range);
   }
 
+  /** The active text selection by block (caretPath.ts), for a session a rebuild ends and reopens. */
+  private editingSelectionBookmark(): TextBookmark | null {
+    if (!this.editingId) return null;
+    const body = this.slideLayer.querySelector<HTMLElement>(
+      `[data-element-id="${CSS.escape(this.editingId)}"] .text-content`,
+    );
+    const range = body ? this.activeTextRange(body) : null;
+    return body && range ? textBookmark(body, TEXT_BLOCKS, range) : null;
+  }
+
   /** Re-select the given offsets inside the element being edited. */
   restoreEditingSelection(offsets: { start: number; end: number } | null): void {
     if (!this.editingId || !offsets) return;
@@ -5314,6 +5364,12 @@ export class EditorCanvas {
      * Chromium splits the paragraph and re-established on the line it opens.
      */
     let breakFormats: TypingFormats | null = null;
+    /**
+     * Whether the text being typed replaces a selection across lines: that
+     * joins blocks as a Backspace across them does, and the join copies the
+     * same computed style onto the moved text.
+     */
+    let typedOverLines = false;
     /** The fitted size the text being pasted was copied at, if it came from an auto-fit box. */
     let pastedFit: string | null = null;
     const onInput = (event?: Event) => {
@@ -5323,7 +5379,9 @@ export class EditorCanvas {
         breakFormats = null;
         this.carryTypingFormatsOntoLine(body, formats);
       }
-      if (typed && typed.inputType !== 'insertText' && !typed.inputType.endsWith('CompositionText')) {
+      const restructured = typed?.inputType === 'insertText' ? typedOverLines : true;
+      typedOverLines = false;
+      if (typed && restructured && !typed.inputType.endsWith('CompositionText')) {
         // Whenever Chromium restructures blocks it copies the computed layout
         // of the block it took apart onto what it made: a cut or Backspace
         // across a list item boundary wraps the moved text in a span wearing
@@ -5331,7 +5389,9 @@ export class EditorCanvas {
         // into a paragraph carrying that indent in pixels. Paste strips those
         // declarations on the way in; every other structural input has to as
         // well, or the box saves an indent no control can reach. Plain typing
-        // is left alone: it never restructures anything, and it is hot.
+        // is left alone: it never restructures anything, and it is hot. Typing
+        // over lines does (nightly list fuzz seed 2026103001: the joined words
+        // kept the size the box was fitted to before the join).
         stripLayoutDeclarations(body, { keepLineSpacing: true });
         // In an auto-fit box the computed style a join copies includes the
         // fitted size, which would freeze the moved text at it.
@@ -5429,6 +5489,12 @@ export class EditorCanvas {
       else if (offsets) this.restoreTextRange(body, offsets);
     };
     const onBeforeInput = (event: InputEvent) => {
+      if (event.inputType === 'insertText') {
+        const range = this.activeTextRange(body);
+        const blockOf = (node: Node) => (node instanceof Element ? node : node.parentElement)?.closest(TEXT_BLOCKS);
+        typedOverLines = Boolean(range && !range.collapsed
+          && blockOf(range.startContainer) !== blockOf(range.endContainer));
+      }
       if (event.inputType === 'insertParagraph' || event.inputType === 'insertLineBreak') {
         // What the author has switched on or off at the caret is what the
         // next line starts with — including a format switched *off* whose
@@ -5919,6 +5985,16 @@ export class EditorCanvas {
     const range = document.createRange();
     range.setStart(start.node, start.offset);
     range.setEnd(end.node, end.offset);
+    this.selectTextRange(root, range);
+  }
+
+  /** Put a selection taken before `root` was rewritten back, carried through the rewrite. */
+  private restoreTextBookmark(root: HTMLElement, bookmark: TextBookmark): void {
+    this.selectTextRange(root, rangeForBookmark(root, TEXT_BLOCKS, bookmark));
+  }
+
+  /** Make `range` the live selection and the session bookmark. */
+  private selectTextRange(root: HTMLElement, range: Range): void {
     this.textSelectionRange = range.cloneRange();
     // Asserting a live range inside a contenteditable MOVES FOCUS to it in
     // Chromium — no focus() call involved. While the author is in a panel
@@ -6005,7 +6081,13 @@ export class EditorCanvas {
     return true;
   }
 
-  /** Text node whose authored style controls typing at a collapsed caret. */
+  /**
+   * Text node whose authored style controls typing at a collapsed caret, or
+   * null on a line with no text. Only the caret's own line counts: on an empty
+   * line the flat offset lands on a word of the line before or after, and
+   * Return there opened a line in that word's bold, italic and underline
+   * (nightly seed 20261031).
+   */
   private textNodeAtCaret(root: HTMLElement, range: Range): Text | null {
     if (range.startContainer instanceof Text) return range.startContainer;
     const offsets = this.textOffsetsForRange(root, range);
@@ -6013,13 +6095,20 @@ export class EditorCanvas {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let cursor = 0;
     let previous: Text | null = null;
+    let found: Text | null = null;
     for (let current = walker.nextNode(); current; current = walker.nextNode()) {
       const text = current as Text;
-      if (offsets.start <= cursor + text.data.length) return text;
+      if (offsets.start <= cursor + text.data.length) {
+        found = text;
+        break;
+      }
       cursor += text.data.length;
       previous = text;
     }
-    return previous;
+    found ??= previous;
+    const start = range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
+    const line = start?.closest(TEXT_BLOCKS);
+    return found && line && root.contains(line) && !line.contains(found) ? null : found;
   }
 
   /**
@@ -6716,13 +6805,14 @@ export class EditorCanvas {
     );
   }
 
-  /** Return a shared authored spacing for the paragraphs in the live selection. */
-  textSelectionParagraphSpacing(): number | null {
+  /**
+   * The spacing the paragraphs in the selection declare: one value (null when
+   * none declares any), or mixed. Null without a selection.
+   */
+  textSelectionParagraphSpacing(): SelectionBlockValue | null {
     const target = this.selectedTextBlocks(false);
     if (!target) return null;
-    const values = target.blocks.map((block) => Number.parseFloat(block.style.marginBottom));
-    if (values.some((value) => !Number.isFinite(value))) return null;
-    return values.every((value) => value === values[0]) ? values[0] : null;
+    return sharedBlockValue(target.blocks.map((block) => Number.parseFloat(block.style.marginBottom)));
   }
 
   /**
@@ -6737,13 +6827,14 @@ export class EditorCanvas {
     );
   }
 
-  /** The line spacing the paragraphs in the selection share, if they declare one. */
-  textSelectionLineHeight(): number | null {
+  /**
+   * The line spacing the paragraphs in the selection declare: one value (null
+   * when they all follow the box), or mixed. Null without a selection.
+   */
+  textSelectionLineHeight(): SelectionBlockValue | null {
     const target = this.selectedTextBlocks(false);
     if (!target) return null;
-    const values = target.blocks.map((block) => Number(block.style.lineHeight || Number.NaN));
-    if (values.some((value) => !Number.isFinite(value))) return null;
-    return values.every((value) => value === values[0]) ? values[0] : null;
+    return sharedBlockValue(target.blocks.map((block) => Number(block.style.lineHeight || Number.NaN)));
   }
 
   applyTextSelectionColor(value: string | null): boolean {
@@ -6878,7 +6969,11 @@ export class EditorCanvas {
     if (!range) return false;
     if (range.collapsed) {
       const caret = this.textNodeAtCaret(content, range);
-      return Boolean(caret && this.textNodeFormatState(caret, content, format));
+      if (caret) return this.textNodeFormatState(caret, content, format);
+      // A line with no text: what the caret sits in (an empty formatted run,
+      // or the bare line).
+      const start = range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
+      return this.elementFormatState(start, content, format);
     }
     const offsets = this.textOffsetsForRange(content, range);
     const first = offsets ? this.textSlicesForOffsets(content, offsets)[0]?.text : null;
@@ -7990,6 +8085,53 @@ export class EditorCanvas {
       if (recipient >= 0) widths[recipient] += removed;
       return widths;
     });
+    this.syncTableHeight(selected.elementId);
+  }
+
+  insertTableRow(after: boolean): void {
+    const table = this.activeTable();
+    const selected = this.tableSelection;
+    if (!table || !selected) return;
+    const selectedStart = Math.min(selected.row, selected.rowEnd);
+    const selectedEnd = Math.max(selected.row, selected.rowEnd);
+    const index = insertTableRow(table, after ? selectedEnd : selectedStart, after);
+    if (index < 0) return;
+    // The new row is selected — unless merged cells running through it
+    // cover every column, in which case the selection stays on the cells it
+    // was on, which have shifted down when the row went in above them.
+    const column = Math.min(selected.column, selected.columnEnd);
+    const created = table.rows[index];
+    if (created.cells.length > 0) {
+      selected.row = index;
+      selected.rowEnd = index;
+      selected.column = Math.min(column, created.cells.length - 1);
+      selected.columnEnd = selected.column;
+    } else if (!after) {
+      selected.row += 1;
+      selected.rowEnd += 1;
+    }
+    selected.mode = 'cell';
+    selected.rows = table.rows.length;
+    this.commitTableDom('Insert table row');
+    this.syncTableHeight(selected.elementId);
+  }
+
+  deleteTableRow(): void {
+    const table = this.activeTable();
+    const selected = this.tableSelection;
+    if (!table || !selected) return;
+    const start = Math.min(selected.row, selected.rowEnd);
+    const end = Math.max(selected.row, selected.rowEnd);
+    if (end - start + 1 >= table.rows.length) return;
+    const column = Math.min(selected.column, selected.columnEnd);
+    deleteTableRows(table, start, end);
+    selected.rows = table.rows.length;
+    selected.row = Math.min(start, selected.rows - 1);
+    selected.rowEnd = selected.row;
+    selected.column = Math.max(0, Math.min(column, (table.rows[selected.row]?.cells.length ?? 1) - 1));
+    selected.columnEnd = selected.column;
+    selected.mode = 'cell';
+    this.commitTableDom(start === end ? 'Delete table row' : 'Delete table rows');
     this.syncTableHeight(selected.elementId);
   }
 

@@ -104,6 +104,9 @@ else setTimeout(() => { fs.copyFileSync(${JSON.stringify(fixture)}, path.join(ou
       return !targets.some(target => target.id === audience.id);
     }, 'Escape closed the presentation');
   } finally { player.close(); }
+  await eventually(() => editor.evaluate(`document.querySelector('[data-index][data-slide-id].active')?.getAttribute('data-slide-id') === 'next-slide'`), 'editor follows the last presented slide');
+  await editor.click('[data-index="0"][data-slide-id]', 'return to the slide with the imported video');
+  await eventually(() => editor.evaluate(`document.querySelectorAll('#canvas video').length === 1`), 'imported video still on the first slide');
   await open(); await submit('https://youtu.be/bbbbbbbbbbb');
   await eventually(() => editor.evaluate(`document.querySelector('#youtube-error').textContent.includes('Video unavailable')`), 'failure');
   await editor.click('[data-cancel]', 'close error');

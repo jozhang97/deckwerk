@@ -62,6 +62,7 @@ import { statusBarText } from './statusBar.js';
 import { BuildPreview } from './buildPreview.js';
 import { TimelinePanel } from './timelinePanel.js';
 import { WelcomeScreen } from './welcomeScreen.js';
+import { showConfirmDialog } from './confirmDialog.js';
 import { CollabBridge } from '../collab/collabBridge.js';
 import { PresenceOverlay } from '../collab/presenceOverlay.js';
 import { openEndCollaborationPopover } from '../collab/endCollaborationPopover.js';
@@ -74,6 +75,10 @@ import { applySpeakerNotes } from '@shared/speakerNotes.js';
 import { installResponsiveToolbar } from './responsiveToolbar.js';
 import { setSlideColorSource } from './colorPicker.js';
 import { slideColors } from '@shared/slideColors.js';
+import type { RemoteDeckBinding } from '@shared/ipc.js';
+import { showOpenDialog, type OpenChoice } from './openDialog.js';
+import { showUploadDialog } from './uploadDialog.js';
+import { reconcileOffline } from './remoteSync.js';
 
 applyUiTheme();
 applyUiScale();
@@ -249,12 +254,19 @@ let agentSessionBridge: CollabBridge | null = null;
 let agentSessionReady = false;
 let agentSessionWsUrl: string | null = null;
 let agentPresence: PresenceOverlay | null = null;
-let activeSessionMode: 'agent' | 'collaboration' | null = null;
+let activeSessionMode: 'agent' | 'collaboration' | 'remote' | null = null;
+/** The server deck this window's folder mirrors, while one is open (remoteDecks.ts). */
+let remoteBinding: RemoteDeckBinding | null = null;
+let remoteChip: HTMLButtonElement | null = null;
+let remoteConnected = false;
+let remoteProblem: string | null = null;
 let collaborateButton: HTMLButtonElement | null = null;
 const persistThemeCss = (css: string): Promise<void> | void => {
   if (agentSessionReady && agentSessionBridge) {
     agentSessionBridge.sendTheme(css);
-    return;
+    // A server deck's mirror keeps its own theme.css too: it is what opens
+    // offline, and the base of the next merge.
+    if (!remoteBinding) return;
   }
   return window.api.saveTheme(css);
 };
@@ -300,9 +312,14 @@ function queueAgentSessionSnapshot(): void {
 }
 const welcome = new WelcomeScreen(el('canvas'), {
   newPresentation,
-  openPresentation,
+  openPresentation: () => openPresentation(),
+  openFromServer: async () => {
+    const servers = await window.api.remoteServers().catch(() => []);
+    await openPresentation({ start: servers.length > 0 ? 'server' : 'connect' });
+  },
   importKeynote: importKeynotePresentation,
   importPowerPoint: importPowerPointPresentation,
+  openTutorial: () => openTutorial(),
 });
 const agentPanel = new AgentPanel({
   currentDeckPath: () => store.get().dir,
@@ -316,14 +333,12 @@ const agentPanel = new AgentPanel({
  */
 let pendingTrimElementId: string | null = null;
 
-const openTrim = (element: Extract<SlideElement, { type: 'video' }>) => {
-  pendingTrimElementId = element.id;
-  void window.api.openTrim({ src: element.src, elementId: element.id });
-};
 const openRaster = (element: Extract<SlideElement, { type: 'image' }>) => {
   void window.api.openRaster({ src: element.src, elementId: element.id });
 };
-wireCanvasInspector(canvas, inspector, openTrim, openRaster);
+// The ffmpeg trim window (src/renderer/trim) is retired: nothing opens it, so
+// neither the inspector nor the right-click menu offers "Edit w/ ffmpeg…".
+wireCanvasInspector(canvas, inspector, undefined, openRaster);
 
 /**
  * The agent's window into this editor: it publishes the computed selection to
@@ -520,6 +535,18 @@ async function placeSyncedSlides(
 
 
 let deckNameLabel: HTMLElement | null = null;
+let resetTutorialButton: HTMLButtonElement | null = null;
+/** The person's tutorial folder; null until known, or when none ships. */
+let tutorialDir: string | null = null;
+void window.api.tutorialInfo().then((info) => {
+  tutorialDir = info.available ? info.dir.replace(/[\\/]+$/, '') : null;
+  syncDeckNameLabel();
+}, (error: unknown) => console.error('Could not locate the tutorial:', error));
+
+function isTutorialOpen(): boolean {
+  const { dir } = store.get();
+  return tutorialDir !== null && dir !== null && dir.replace(/[\\/]+$/, '') === tutorialDir;
+}
 
 function barDivider(): HTMLElement {
   const divider = document.createElement('span');
@@ -537,6 +564,7 @@ function syncDeckNameLabel(): void {
   deckNameLabel.textContent = name;
   deckNameLabel.hidden = name === '';
   deckNameLabel.title = dir ?? '';
+  if (resetTutorialButton) resetTutorialButton.hidden = !isTutorialOpen();
 }
 
 function buildToolbar(): void {
@@ -564,8 +592,15 @@ function buildToolbar(): void {
       } },
     );
   }
+  // A server deck is already where an upload would put it.
+  const uploadEntry = {
+    label: 'Upload to Server…',
+    action: () => void uploadToServer(),
+    hidden: () => remoteBinding !== null,
+  };
   const saveEntries = [
     { label: 'Deck…', action: () => void saveAsPresentation() },
+    uploadEntry,
     {
       label: 'Lossy export',
       options: [
@@ -576,7 +611,11 @@ function buildToolbar(): void {
   ];
   fileActions.append(
     barButton('New', newPresentation),
-    barButton('Open', openPresentation),
+    createToolbarSplitButton('Open', () => void openPresentation(), [
+      { label: 'Open Folder…', action: () => void openLocalPresentation() },
+      { label: 'Connect to Server…', action: () => void openPresentation({ start: 'connect' }) },
+      { label: 'Tutorial', action: () => void openTutorial() },
+    ], { menuLabel: 'Open options' }),
     createToolbarPicker('Import…', importEntries),
     createToolbarPicker('Save As…', saveEntries, { deckOnly: true }),
   );
@@ -585,7 +624,9 @@ function buildToolbar(): void {
       label: 'Presentation',
       options: [
         { label: 'New', action: newPresentation },
-        { label: 'Open…', action: openPresentation },
+        { label: 'Open…', action: () => void openPresentation() },
+        { label: 'Connect to Server…', action: () => void openPresentation({ start: 'connect' }) },
+        { label: 'Tutorial', action: () => void openTutorial() },
       ],
     },
     { label: 'Import', options: importEntries },
@@ -593,15 +634,31 @@ function buildToolbar(): void {
       label: 'Save and export',
       options: [
         { label: 'Save As…', action: () => void saveAsPresentation() },
+        uploadEntry,
         { label: 'Export PDF…', action: () => void exportPdf() },
         { label: 'Export Web…', action: () => void exportWeb() },
       ],
     },
   ], { deckOnly: true });
   compactFile.classList.add('toolbar-compact-file-action');
+  remoteChip = document.createElement('button');
+  remoteChip.type = 'button';
+  remoteChip.className = 'remote-status';
+  remoteChip.hidden = true;
+  remoteChip.addEventListener('click', () => {
+    if (!remoteConnected) agentSessionBridge?.reconnectNow();
+  });
+  resetTutorialButton = barButton('Reset tutorial', () => void resetTutorial());
+  resetTutorialButton.title = 'Put back the tutorial as DeckWerk ships it (undoable)';
+  resetTutorialButton.hidden = true;
   left.append(
-    createDeckWerkButton(),
+    createDeckWerkButton({
+      askAgentPrompt: () => window.api.tutorialPrompt(),
+      onStatus: setStatusMessage,
+    }),
     deckNameLabel,
+    resetTutorialButton,
+    remoteChip,
     createHistoryButton(historyHost),
     barDivider(),
     fileActions,
@@ -848,6 +905,8 @@ el('canvas').addEventListener('mouseleave', clearCollaborationCursor);
 
 function refreshCollaborationControl(): void {
   if (!collaborateButton) return;
+  // A server deck is already shared: everyone on the server edits it.
+  collaborateButton.hidden = activeSessionMode === 'remote';
   const sharing = activeSessionMode === 'collaboration';
   collaborateButton.textContent = sharing ? 'End collaboration' : 'Collaborate';
   collaborateButton.classList.toggle('danger', sharing);
@@ -957,6 +1016,239 @@ function disconnectAgentSession(): void {
   agentPresence = null;
   rail.presenceForSlide = undefined;
   rail.refreshPresence();
+  if (remoteBinding) canvas.liveTextSync = false;
+  remoteBinding = null;
+  remoteConnected = false;
+  remoteProblem = null;
+  if (remoteSaveTimer) clearTimeout(remoteSaveTimer);
+  remoteSaveTimer = null;
+  renderRemoteChip();
+}
+
+/* --- server decks: a mirror folder kept in sync, editable offline --- */
+
+let remoteSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let lastRemoteBaseline: { deck: Deck; themeCss: string; seq: number } | null = null;
+
+/** Written after the deck.json it belongs with, in the same queue. */
+function queueRemoteBaseline(dir: string, baseline: { deck: Deck; themeCss: string; seq: number }): Promise<void> {
+  if (lastRemoteBaseline && lastRemoteBaseline.deck === baseline.deck
+    && lastRemoteBaseline.themeCss === baseline.themeCss && lastRemoteBaseline.seq === baseline.seq) {
+    return Promise.resolve();
+  }
+  const next = mainSessionPersistence
+    .catch(() => {})
+    .then(() => window.api.saveRemoteBaseline(dir, baseline))
+    .then(() => { lastRemoteBaseline = baseline; });
+  mainSessionPersistence = next;
+  return next;
+}
+
+/**
+ * A server deck changed under the mirror (a collaborator's edit, a merge):
+ * write the mirror and its baseline soon, as an edit here would be. Without
+ * it a quit right after would reopen a deck.json older than its baseline,
+ * and the next merge would read the difference as edits made here.
+ */
+function scheduleRemotePersist(): void {
+  if (!remoteBinding) return;
+  if (remoteSaveTimer) clearTimeout(remoteSaveTimer);
+  remoteSaveTimer = setTimeout(() => {
+    remoteSaveTimer = null;
+    void save({ flushHistory: false }).catch((error) => {
+      console.error('Could not save the server deck copy:', error);
+    });
+  }, 800);
+}
+
+function renderRemoteChip(): void {
+  if (!remoteChip) return;
+  if (!remoteBinding) {
+    if (!remoteChip.hidden) remoteChip.hidden = true;
+    return;
+  }
+  const unsent = agentSessionBridge?.unconfirmed ?? 0;
+  const server = remoteBinding.serverName;
+  let state: 'online' | 'offline' | 'error' | 'syncing';
+  let text: string;
+  if (remoteProblem) {
+    state = 'error';
+    text = `${server}: ${remoteProblem}`;
+  } else if (agentSessionBridge?.isReconciling) {
+    state = 'syncing';
+    text = `${server} · merging`;
+  } else if (remoteConnected) {
+    state = unsent > 0 ? 'syncing' : 'online';
+    text = unsent > 0 ? `${server} · syncing` : `${server} · synced`;
+  } else {
+    state = 'offline';
+    // Unsent transactions are not a count anyone thinks in (live typing sends
+    // several per word), so say what matters: there is work waiting here.
+    text = unsent > 0 ? 'Offline · edits kept on this computer' : 'Offline';
+  }
+  // Runs on every store emit (renderStatus): touch the DOM only for a change.
+  if (remoteChip.hidden) remoteChip.hidden = false;
+  if (remoteChip.dataset.state !== state) remoteChip.dataset.state = state;
+  if (remoteChip.textContent !== text) remoteChip.textContent = text;
+  const title = remoteConnected
+    ? `Editing ${remoteBinding.deckId} on ${remoteBinding.server}. Changes sync live.`
+    : `${remoteBinding.deckId} on ${remoteBinding.server}. Edits are kept on this computer and sync when the server is reachable — click to retry now.`;
+  if (remoteChip.title !== title) remoteChip.title = title;
+}
+
+/** Fetch what the server deck refers to that the mirror lacks, and redraw what was missing it. */
+async function fetchRemoteAssets(deck: Deck): Promise<void> {
+  const binding = remoteBinding;
+  if (!binding) return;
+  const fetched = await window.api.fetchRemoteAssets(binding.dir, deck).catch(() => [] as string[]);
+  if (fetched.length === 0 || remoteBinding !== binding) return;
+  canvas.forceRedraw();
+  rail.redrawThumbnails();
+}
+
+let lastAssetCheck: Deck | null = null;
+function noteRemoteDeck(deck: Deck): void {
+  scheduleRemotePersist();
+  // Cheap to ask; main checks the files. One question per new deck object.
+  if (deck === lastAssetCheck) return;
+  lastAssetCheck = deck;
+  void fetchRemoteAssets(deck);
+}
+
+/** After any deck is adopted: if its folder mirrors a server deck, go live. */
+async function attachRemoteDeck(dir: string): Promise<void> {
+  let binding: RemoteDeckBinding | null = null;
+  try {
+    binding = await window.api.remoteBinding(dir);
+  } catch (error) {
+    console.error('Could not read the server deck binding:', error);
+  }
+  if (store.get().dir !== dir) return;
+  if (!binding) {
+    if (remoteBinding) disconnectAgentSession();
+    return;
+  }
+  connectRemoteDeck(binding);
+}
+
+function connectRemoteDeck(binding: RemoteDeckBinding): void {
+  disconnectAgentSession();
+  activeSessionMode = 'remote';
+  refreshCollaborationControl();
+  remoteBinding = binding;
+  lastRemoteBaseline = null;
+  // Typing streams to collaborators as it happens, and theirs merges into a
+  // box being edited here — the browser client's text path.
+  canvas.liveTextSync = true;
+  agentPresence = new PresenceOverlay(canvas, store);
+  rail.presenceForSlide = (slideId) => agentPresence?.peersOnSlide(slideId) ?? [];
+  const live = () => agentSessionBridge === bridge;
+
+  const bridge = new CollabBridge(binding.wsUrl ?? 'ws://127.0.0.1:9/unavailable', binding.name, {
+    onWelcome: (welcome) => {
+      if (!live()) return;
+      setIdSuffix(welcome.clientId.slice(0, 4));
+      remoteProblem = null;
+      if (JSON.stringify(store.get().deck) !== JSON.stringify(welcome.deck)) {
+        store.applyRemote(welcome.deck, `Synchronized with ${binding.serverName}`, { coalesce: false });
+      }
+      if (welcome.themeCss !== cssEditor.getValue()) {
+        cssEditor.setValue(welcome.themeCss);
+        void window.api.saveTheme(welcome.themeCss);
+      }
+      themePanel.noteDeckOpened(store.get().deck);
+      for (const peer of welcome.peers) agentPresence?.upsert(peer);
+      rail.refreshPresence();
+      lastAgentPresenceKey = '';
+      lastCollaborationCursorKey = '';
+      publishAgentPresence();
+      queueAgentSessionSnapshot();
+      noteRemoteDeck(store.get().deck);
+      // Files made here while offline go up; files peers added come down.
+      void window.api.syncRemoteFiles(binding.dir)
+        .then(() => fetchRemoteAssets(store.get().deck))
+        .catch((error) => console.error('Could not sync server deck files:', error));
+      renderRemoteChip();
+    },
+    onDeckReplaced: (deck, label, options) => {
+      store.applyRemote(deck, label, options);
+      queueAgentSessionSnapshot();
+      noteRemoteDeck(deck);
+    },
+    onPeerPresence: (state) => {
+      agentPresence?.upsert(state);
+      rail.refreshPresence();
+    },
+    onPeerCursor: (clientId, cursor) => agentPresence?.moveCursor(clientId, cursor),
+    onPeerLeft: (clientId) => {
+      agentPresence?.remove(clientId);
+      rail.refreshPresence();
+    },
+    onThemeCss: (css) => {
+      if (!cssEditor.hasFocus() && css !== cssEditor.getValue()) cssEditor.setValue(css);
+      void window.api.saveTheme(css);
+      queueAgentSessionSnapshot();
+      scheduleRemotePersist();
+    },
+    onStatus: () => renderRemoteChip(),
+    // The mirror is saved like any deck; the server confirming an edit does
+    // not make it clean on disk here.
+    onCleanChange: () => renderRemoteChip(),
+    onConnectionChange: (connected) => {
+      remoteConnected = connected;
+      if (!connected) {
+        agentPresence?.replaceAll([]);
+        rail.refreshPresence();
+      }
+      renderRemoteChip();
+    },
+    onAccessRevoked: () => {
+      remoteProblem = 'no access';
+      renderRemoteChip();
+    },
+    onUnavailable: (reason) => {
+      remoteProblem = reason;
+      renderRemoteChip();
+    },
+    onMoved: (moved) => {
+      remoteProblem = `moved to ${moved.deckId}`;
+      renderRemoteChip();
+    },
+  }, {
+    local: () => ({ deck: store.get().deck, themeCss: cssEditor.getValue() }),
+    reconcile: async (input) => {
+      renderRemoteChip();
+      store.setEditLock(`Merging your offline changes with ${binding.serverName}…`);
+      try {
+        const result = await reconcileOffline(input, {
+          serverName: binding.serverName,
+          prefetch: async (deck) => {
+            await window.api.syncRemoteFiles(binding.dir).catch(() => undefined);
+            await window.api.fetchRemoteAssets(binding.dir, deck);
+          },
+        });
+        if (result.asked) setStatusMessage(`Merged your offline changes with ${binding.serverName}.`);
+        return result;
+      } finally {
+        store.setEditLock(null);
+      }
+    },
+    onReconciled: ({ sent, themeSent }) => {
+      if (!live()) return;
+      if (sent > 0 || themeSent) {
+        setStatusMessage(`Synced offline changes with ${binding.serverName}.`);
+      }
+      renderRemoteChip();
+    },
+  });
+  bridge.seed(binding.baseline);
+  agentSessionBridge = bridge;
+  agentSessionReady = true;
+  agentSessionWsUrl = binding.wsUrl;
+  store.onLocalEdit = bridge.localEdit;
+  if (binding.wsUrl) bridge.connect();
+  else remoteProblem = 'server not in your list';
+  renderRemoteChip();
 }
 
 async function newPresentation(): Promise<void> {
@@ -970,7 +1262,143 @@ async function newPresentation(): Promise<void> {
   }
 }
 
-async function openPresentation(): Promise<void> {
+/**
+ * Open: with a deck server known, one dialog covers the decks opened last,
+ * this computer and the servers; without one, straight to the system folder
+ * picker as always.
+ */
+async function openPresentation(options: { start?: 'connect' | 'server' } = {}): Promise<void> {
+  let choice: OpenChoice | null;
+  try {
+    const servers = await window.api.remoteServers();
+    choice = servers.length === 0 && !options.start ? { kind: 'local' } : await showOpenDialog(window.api, options);
+  } catch (err) {
+    setStatusMessage(`Open failed: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
+  if (!choice) return;
+  if (choice.kind === 'local') return openLocalPresentation();
+  if (choice.kind === 'folder') {
+    // A recent deck is a folder on this computer either way. One that is the
+    // copy of a server deck connects once it is open, and syncs then.
+    const { dir, title } = choice;
+    try {
+      await runOperation(`Opening “${title}”…`, async (operation) => {
+        operation.update(`Reading ${dir.split(/[\\/]/).pop() ?? dir}/deck.json`);
+        const session = await window.api.openDeckPath(dir);
+        if (session) await adopt(session.dir, session.deck, operation);
+      });
+    } catch (err) {
+      setStatusMessage(`Open failed: ${err instanceof Error ? err.message : err}`);
+    }
+    return;
+  }
+  const { serverId, deckId, title, offline } = choice;
+  try {
+    await runOperation(`Opening “${title}”…`, async (operation) => {
+      const session = await window.api.openRemoteDeck(serverId, deckId, operation.id, offline ? { offline } : undefined);
+      if (session) await adopt(session.dir, session.deck, operation);
+    });
+  } catch (err) {
+    setStatusMessage(`Open failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** The folder an upload is under way for, from its dialog opening to the last file. */
+let uploadingDir: string | null = null;
+
+/**
+ * Put the open deck on a server. Its folder stays where it is and becomes the
+ * copy that stays in sync (remoteDecks.ts), so the editor goes live on it as
+ * soon as the upload is done.
+ */
+async function uploadToServer(): Promise<void> {
+  const dir = store.get().dir;
+  if (!dir) return;
+  if (remoteBinding) {
+    setStatusMessage(`This presentation is already on ${remoteBinding.serverName}, as ${remoteBinding.deckId}.`);
+    return;
+  }
+  if (activeSessionMode) {
+    setStatusMessage('End collaboration before uploading this presentation to a server.');
+    return;
+  }
+  // A second upload of the same folder would make a second deck of it.
+  if (uploadingDir === dir) {
+    setStatusMessage('This presentation is already being uploaded.');
+    return;
+  }
+  uploadingDir = dir;
+  try {
+    if ((await window.api.remoteServers()).length === 0) {
+      setStatusMessage('Connect to a server first (Connect to Server…), then upload.');
+      return;
+    }
+    const choice = await showUploadDialog(window.api, { name: dir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '' });
+    if (!choice || store.get().dir !== dir) return;
+    const { serverName, ...request } = choice;
+    const result = await runOperation(`Uploading to ${serverName}…`, async (operation) => {
+      operation.update('Saving deck.json and theme.css');
+      await cssEditor.flush();
+      await save();
+      return window.api.uploadDeckToServer(dir, request, operation.id);
+    });
+    // The folder mirrors the server deck now: join it, as reopening would.
+    if (store.get().dir === dir) await attachRemoteDeck(dir);
+    setStatusMessage(result.problem
+      ? `On ${serverName} as ${result.deckId}, and this folder stays in sync with it — but ${result.problem}. Files still to go follow when the server is reachable.`
+      : `Uploaded to ${serverName} as ${result.deckId}. This folder now stays in sync with it.`);
+  } catch (err) {
+    setStatusMessage(`Upload failed: ${err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : err}`);
+  } finally {
+    if (uploadingDir === dir) uploadingDir = null;
+  }
+}
+
+/** Open the person's copy of the tutorial, installing or updating it first. */
+async function openTutorial(slideId?: string): Promise<void> {
+  try {
+    await runOperation('Opening the tutorial…', async (operation) => {
+      const session = await window.api.openTutorial(operation.id, slideId);
+      if (session) await adopt(session.dir, session.deck, operation);
+    });
+  } catch (err) {
+    setStatusMessage(`Could not open the tutorial: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/**
+ * Put back the tutorial as it ships, as one entry in the deck's history: Cmd+Z
+ * or History brings back whatever the person or their agent had done to it.
+ */
+async function resetTutorial(): Promise<void> {
+  if (!isTutorialOpen()) return;
+  const confirmed = await showConfirmDialog({
+    title: 'Reset tutorial',
+    description: 'Put back every tutorial slide as DeckWerk ships it? Slides you or your agent added are removed too. Undo, or History, brings everything back.',
+    confirmLabel: 'Reset',
+  });
+  if (!confirmed || !isTutorialOpen()) return;
+  try {
+    const shipped = await window.api.tutorialShippedDeck();
+    if (!isTutorialOpen()) return;
+    store.replaceWithHistory(shipped, 'Reset tutorial');
+    store.selectSlide(0);
+    setStatusMessage('Tutorial reset. Undo brings back what was there.');
+  } catch (err) {
+    setStatusMessage(`Could not reset the tutorial: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** Show a slide by id, if the open deck has it. */
+function showSlideById(slideId: string): boolean {
+  const index = store.get().deck.slides.findIndex((slide) => slide.id === slideId);
+  if (index < 0) return false;
+  store.selectSlide(index);
+  return true;
+}
+
+async function openLocalPresentation(): Promise<void> {
   try {
     await runOperation('Opening presentation…', async (operation) => {
       const session = await window.api.openDeck(operation.id);
@@ -1267,8 +1695,12 @@ async function save(opts: { flushHistory?: boolean } = {}): Promise<void> {
     saveTimer = null;
   }
   const deck = store.get().deck;
+  // Taken in the same tick as the deck: the baseline is a server state the
+  // deck on screen already contains, so the next merge starts from it.
+  const baseline = remoteBinding?.dir === dir ? agentSessionBridge?.baseline() ?? null : null;
   try {
-    await queueMainSessionPersistence(dir, deck, cssEditor.getValue(), agentSessionReady);
+    await queueMainSessionPersistence(dir, deck, cssEditor.getValue(), agentSessionReady && !remoteBinding);
+    if (baseline) await queueRemoteBaseline(dir, baseline);
   } catch (error) {
     // Another deck was opened while this write was in flight, and the main
     // process refused it rather than writing these slides into that deck's
@@ -1358,6 +1790,12 @@ async function adopt(
   if (fonts) await fonts.ready;
   operation?.update('Finishing initial display', 0.99);
   await operation?.waitForPaint();
+  if (generation === adoptGeneration) await attachRemoteDeck(dir);
+  // A tutorial link (deckwerk://tutorial/<slide>) that opened this deck.
+  const linkedSlide = await window.api.takeShowSlide(dir).catch(() => null);
+  if (linkedSlide && generation === adoptGeneration && !showSlideById(linkedSlide)) {
+    setStatusMessage(`The tutorial has no slide ${linkedSlide}.`);
+  }
 }
 
 /* --- keyboard, clipboard, context menu: shared shell wiring --- */
@@ -1370,7 +1808,6 @@ const shellDeps: ShellDeps = {
   setStatusMessage,
   runOperation: (message, action) => runOperation(message, async () => action()),
   currentThemeCss: () => cssEditor.getValue(),
-  openTrim,
   openRaster,
   downloadOriginal: { label: 'Download original…', run: (element) => void saveOriginalAsset(element.src) },
   undo: () => {
@@ -1442,6 +1879,7 @@ function renderStatus(): void {
   // costs a style and paint invalidation of the full-width footer.
   const text = statusBarText(store.get(), statusMessage);
   if (status.textContent !== text) status.textContent = text;
+  renderRemoteChip();
   const busy = statusBusy ? 'true' : 'false';
   if (status.dataset.busy !== busy) status.dataset.busy = busy;
   if (status.getAttribute('aria-busy') !== busy) status.setAttribute('aria-busy', busy);
@@ -1545,6 +1983,18 @@ canvas.contextActions = makeContextActions(shellDeps, clipboard);
 // Watch mode: the main process reloads the deck when deck.json changes on
 // disk (an agent, a git checkout, hand editing) and broadcasts it here. Our
 // own saves echo back identical content and are ignored by comparison.
+window.api.onPresentNotesEdit(({ slideId, notes }) => {
+  const slide = store.get().deck.slides.find((item) => item.id === slideId);
+  if (!slide || slide.notes === notes) return;
+  store.commit((deck) => {
+    const target = deck.slides.find((item) => item.id === slideId);
+    if (target) target.notes = notes;
+  }, { label: 'Edit speaker notes' });
+});
+window.api.onShowSlide((request) => {
+  if (request.dir !== store.get().dir) return;
+  if (!showSlideById(request.slideId)) setStatusMessage(`The tutorial has no slide ${request.slideId}.`);
+});
 window.api.onDeckState((session) => {
   const state = store.get();
   if (
@@ -1563,7 +2013,13 @@ window.api.onDeckState((session) => {
     });
     return;
   }
+  const before = state.deck;
   store.replaceExternal(session.deck, session.dir);
+  // In a server deck's mirror, a deck.json rewritten on disk (a local agent's
+  // transaction with the editor's watcher in between) is this side's edit.
+  if (remoteBinding?.dir === session.dir && agentSessionBridge) {
+    agentSessionBridge.localEdit(before, store.get().deck, 'Edited on disk');
+  }
   welcome.setVisible(false);
   themePanel.refreshSwatches();
   setStatusMessage('Deck reloaded from disk.');

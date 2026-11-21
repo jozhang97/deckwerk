@@ -76,7 +76,7 @@ import { createDeckNameField, type DeckNameField } from './deckNameField.js';
 import { AgentPanel } from '../editor/agentPanel.js';
 import { agentConnectPrompt } from './agentPrompt.js';
 import { RemoteReceiver } from './remoteControl.js';
-import { isPhone, rememberShell, shellUrl, wantsMobileShell } from './mobileShell.js';
+import { fitViewportToDevice, isPhone, rememberShell, shellUrl, wantsMobileShell } from './mobileShell.js';
 import { isPresenting, startPresenting } from './presentOverlay.js';
 import { rangeForSlideSelection } from '@shared/presentationRange.js';
 import { setRenderInvariantChecks } from '../editor/renderInvariants.js';
@@ -88,6 +88,8 @@ import { DesignWorkspace } from '../editor/designWorkspace.js';
 import { installResponsiveToolbar } from '../editor/responsiveToolbar.js';
 import { setSlideColorSource } from '../editor/colorPicker.js';
 import { slideColors } from '@shared/slideColors.js';
+import { askAgentPrompt, type ServerTutorialInfo } from '@shared/tutorial.js';
+import { openServerTutorial, tutorialUrl } from './tutorialBar.js';
 
 applyUiTheme();
 applyUiScale();
@@ -177,6 +179,8 @@ interface ServerConfig {
    * the admin, and is what renaming takes).
    */
   access?: null | { user: string; name: string; admin: boolean; deckRole?: 'owner' | 'edit' | 'view' | null };
+  /** The server's shared tutorial; absent on servers without one and on older servers. */
+  tutorial?: ServerTutorialInfo | null;
 }
 
 const CONFIG_TIMEOUT_MS = 5_000;
@@ -262,6 +266,8 @@ async function runOperation<T>(message: string, action: () => Promise<T>): Promi
 }
 
 if (!deckId) {
+  // Only the deck list shows, and on a phone it lays out for the phone.
+  if (isPhone() || wantsMobileShell()) fitViewportToDevice();
   el('status').textContent = 'Connecting…';
   void fetchServerConfig().then((config) => {
     if (config.hosted && config.deckId) {
@@ -278,6 +284,8 @@ if (!deckId) {
       dismissable: false,
       onStatus: (text) => { el('status').textContent = text; },
       access: config.access ?? null,
+      // The phone client's "All presentations" opens the list in its deck's folder.
+      folder: new URLSearchParams(location.search).get('folder') ?? undefined,
     });
   });
   throw new Error('no deck selected — showing picker');
@@ -554,6 +562,20 @@ setCommentLinks((commentId) => {
   return url.href;
 });
 let linkedCommentPending = new URLSearchParams(location.search).get('comment');
+/**
+ * `slide=<id or 1-based number>`: open on that slide. Agents answering a
+ * question link a slide this way (FEATURES.md), and ids survive slides being
+ * added where numbers do not.
+ */
+let linkedSlidePending = new URLSearchParams(location.search).get('slide');
+
+/** The index of the slide a `slide=` parameter names, or -1. */
+function linkedSlideIndex(slides: readonly { id: string }[], value: string): number {
+  const byId = slides.findIndex((slide) => slide.id === value);
+  if (byId >= 0 || !/^\d+$/.test(value)) return byId;
+  const number = Number(value);
+  return number >= 1 && number <= slides.length ? number - 1 : -1;
+}
 
 /** Go to the slide holding a comment, select what it is on, and open its thread. */
 function openCommentById(commentId: string): void {
@@ -684,6 +706,16 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     if (initialViewPending) {
       restoreEditorView(store, initialView);
       initialViewPending = false;
+    }
+    if (linkedSlidePending) {
+      const index = linkedSlideIndex(store.get().deck.slides, linkedSlidePending);
+      linkedSlidePending = null;
+      if (index >= 0) store.selectSlide(index);
+      else setStatusMessage('That slide is not in this presentation any more.');
+      // Reloading should open on wherever the person is by then.
+      const params = new URLSearchParams(location.search);
+      params.delete('slide');
+      history.replaceState(history.state, '', `${location.pathname}?${params.toString()}${location.hash}`);
     }
     if (linkedCommentPending) {
       const commentId = linkedCommentPending;
@@ -1121,7 +1153,19 @@ function buildToolbar(): void {
     rename: renameDeck,
     onError: (message) => setStatusMessage(`Rename failed: ${message}`),
   });
-  left.append(createDeckWerkButton(), deckNameField.element, createHistoryButton(historyHost), divider());
+  const tutorial = serverConfig.tutorial ?? null;
+  const deckWerkButton = createDeckWerkButton(tutorial ? {
+    // The person's agent reads the server's feature reference and links the
+    // shared tutorial; nothing about this deck goes into the prompt.
+    askAgentPrompt: async () => askAgentPrompt({
+      kind: 'server',
+      origin: location.origin,
+      featuresUrl: new URL(tutorial.featuresPath, location.origin).href,
+      tutorialUrl: tutorialUrl(),
+    }),
+    onStatus: setStatusMessage,
+  } : {});
+  left.append(deckWerkButton, deckNameField.element, createHistoryButton(historyHost), divider());
   const fileActions = document.createElement('span');
   fileActions.className = 'toolbar-expanded-file-actions';
   const compactFileEntries: ToolbarPickerEntry[] = [];
@@ -1148,7 +1192,9 @@ function buildToolbar(): void {
       barButton('New', () => {
         createDeck();
       }),
-      barButton('Open', openDeck),
+      tutorial
+        ? createToolbarSplitButton('Open', openDeck, [{ label: 'Tutorial', action: openServerTutorial }])
+        : barButton('Open', openDeck),
       createToolbarPicker('Import…', importEntries),
     );
     compactFileEntries.push(
@@ -1157,6 +1203,7 @@ function buildToolbar(): void {
         options: [
           { label: 'New', action: createDeck },
           { label: 'Open…', action: openDeck },
+          ...(tutorial ? [{ label: 'Tutorial', action: openServerTutorial }] : []),
         ],
       },
       { label: 'Import', options: importEntries },

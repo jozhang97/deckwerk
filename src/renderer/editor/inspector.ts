@@ -1,6 +1,6 @@
 import { codeTypeSection } from './codeInspector.js';
 import {
-  STROKE_DASHES, STROKE_STYLES, type Deck, type MediaEffect, type ShapeEl, type Slide, type SlideElement, type StrokeDash,
+  MAX_VIDEO_SPEED, MIN_VIDEO_SPEED, STROKE_DASHES, STROKE_STYLES, videoSpeed, type Deck, type MediaEffect, type ShapeEl, type Slide, type SlideElement, type StrokeDash,
   type StrokeStyle,
 } from '@shared/deck.js';
 import { braceDepthOf } from '@shared/brace.js';
@@ -23,6 +23,7 @@ import {
   type ListMarkerColorState,
 } from '@shared/paragraphs.js';
 import type {
+  SelectionBlockValue,
   TableBorderPreset,
   TableBorderSettings,
   TableSelection,
@@ -198,11 +199,11 @@ export class Inspector {
   /** Apply spacing after only the paragraphs covered by the live text selection. */
   onApplyTextSelectionParagraphSpacing?: (value: number | null) => boolean;
   /** Authored spacing shared by the paragraphs in the live text selection. */
-  textSelectionParagraphSpacing?: () => number | null;
+  textSelectionParagraphSpacing?: () => SelectionBlockValue | null;
   /** Set line spacing on only the paragraphs covered by the live text selection. */
   onApplyTextSelectionLineHeight?: (value: number | null) => boolean;
   /** Line spacing shared by the paragraphs in the live text selection. */
-  textSelectionLineHeight?: () => number | null;
+  textSelectionLineHeight?: () => SelectionBlockValue | null;
   onApplyTextSelectionColor?: (value: string | null) => boolean;
   onApplyTextSelectionAlignment?: (value: 'left' | 'center' | 'right' | 'justify') => boolean;
   /** Convert only the paragraphs covered by the live text selection. */
@@ -238,6 +239,8 @@ export class Inspector {
   };
   onInsertTableColumn?: (after: boolean) => void;
   onDeleteTableColumn?: () => void;
+  onInsertTableRow?: (after: boolean) => void;
+  onDeleteTableRow?: () => void;
   /** Toggle crop-editing mode on the canvas for an image or video. */
   onToggleMask?: (elementId: string) => void;
   /** Which element is currently in mask mode, so the button can reflect it. */
@@ -786,6 +789,39 @@ export class Inspector {
    * which also loops between them — the native `loop` attribute cannot, since
    * it always restarts at zero.
    */
+  /**
+   * How fast the selected videos play, as a multiple of normal speed. Empty
+   * means normal speed. A synced clip's partners take the same speed: the
+   * group plays from one clock, so a partner at another speed could not
+   * stay on its frame.
+   */
+  private videoSpeedField(videos: Array<Extract<SlideElement, { type: 'video' }>>): HTMLElement {
+    const setSpeed = (value: number): void => {
+      const speed = Math.min(MAX_VIDEO_SPEED, Math.max(MIN_VIDEO_SPEED, value));
+      const selection = this.store.get().selection;
+      const groups = new Set(videos.map((video) => video.syncGroup).filter(Boolean));
+      const slideIndex = this.store.get().slideIndex;
+      this.store.commit((deck) => {
+        for (const element of deck.slides[slideIndex]?.elements ?? []) {
+          if (element.type !== 'video') continue;
+          if (!selection.has(element.id) && !(element.syncGroup && groups.has(element.syncGroup))) continue;
+          if (speed === 1) delete element.playbackRate;
+          else element.playbackRate = speed;
+        }
+      }, { label: 'Change video speed' });
+    };
+    const field = numberField('Speed', commonValue(videos.map(videoSpeed)), setSpeed, {
+      step: 0.25,
+      unit: '× normal',
+      placeholder: 'Mixed',
+      onClear: () => setSpeed(1),
+    });
+    field.classList.add('video-speed-field');
+    field.title = 'Playback speed: 2 plays twice as fast, 0.5 at half speed. '
+      + 'The file is untouched; the trim stays in the file\'s own seconds.';
+    return field;
+  }
+
   private trimSection(el: Extract<SlideElement, { type: 'video' }>): HTMLElement {
     const trim = optionSection('Trim', 'video-trim-options');
     const wrap = trim.content;
@@ -1868,6 +1904,9 @@ export class Inspector {
         ), VIDEO_FLAG_SHORT[key]));
       }
       playback.content.appendChild(flags);
+      playback.content.appendChild(this.videoSpeedField(
+        media.filter((element): element is Extract<SlideElement, { type: 'video' }> => element.type === 'video'),
+      ));
       // Real next to simulated, before next to after: one clock while presenting.
       const groups = media.map((element) => (element.type === 'video' ? element.syncGroup ?? null : null));
       const shared = groups[0] !== null && groups.every((group) => group === groups[0]);
@@ -2071,6 +2110,7 @@ export class Inspector {
           ));
         }
         playback.content.appendChild(flags);
+        playback.content.appendChild(this.videoSpeedField([el]));
         if (el.syncGroup) {
           const partners = this.store.slide?.elements.filter((other) =>
             other.id !== el.id && other.type === 'video' && other.syncGroup === el.syncGroup).length ?? 0;
@@ -2587,6 +2627,18 @@ export class Inspector {
             (remove as HTMLButtonElement).disabled = selected.columns <= 1;
             columns.appendChild(remove);
             table.content.appendChild(columns);
+            const rows = document.createElement('div');
+            rows.className = 'button-row table-row-buttons';
+            rows.append(
+              button('Insert row above', () => this.onInsertTableRow?.(false)),
+              button('Insert row below', () => this.onInsertTableRow?.(true)),
+            );
+            const removeRows = button('Delete row', () => this.onDeleteTableRow?.());
+            removeRows.classList.add('danger');
+            // Deleting every row would leave no table: at least one stays.
+            (removeRows as HTMLButtonElement).disabled = rowEnd - rowStart + 1 >= selected.rows;
+            rows.appendChild(removeRows);
+            table.content.appendChild(rows);
           }
           // Table actions operate on the cell selection owned by the live
           // contenteditable. None of these buttons needs focus; keeping the
@@ -2654,10 +2706,16 @@ export class Inspector {
           ),
         );
         layout.content.appendChild(alignment);
+        // Paragraphs that disagree show nothing, so whatever is typed applies
+        // to all of them; a number shown there would be one paragraph's, and
+        // typing that same number would change nothing.
         const selectedParagraphSpacing = this.textSelectionParagraphSpacing?.() ?? null;
-        layout.content.appendChild(optionalNumberField(
+        const shownParagraphSpacing = selectedParagraphSpacing?.mixed
+          ? null
+          : selectedParagraphSpacing?.value ?? el.paragraphSpacing ?? null;
+        const paragraphSpacingField = optionalNumberField(
           'Paragraph spacing',
-          selectedParagraphSpacing ?? el.paragraphSpacing ?? null,
+          shownParagraphSpacing,
           (value) => {
             const spacing = Math.max(0, value);
             if (this.onApplyTextSelectionParagraphSpacing?.(spacing)) return;
@@ -2674,16 +2732,22 @@ export class Inspector {
           'px',
           {
             min: 0,
-            themeValue: (selectedParagraphSpacing ?? el.paragraphSpacing ?? null) === null
+            themeValue: shownParagraphSpacing === null && !selectedParagraphSpacing?.mixed
               ? computedTypography?.paragraphSpacing ?? null
               : null,
           },
-        ));
+        );
+        if (selectedParagraphSpacing?.mixed) {
+          paragraphSpacingField.querySelector('input')!.placeholder = 'Mixed';
+        }
+        layout.content.appendChild(paragraphSpacingField);
         // Editing with a selection, the control is the selected paragraphs'
         // spacing (as Paragraph spacing is); otherwise the box's.
         const selectedLineHeight = this.textSelectionLineHeight?.() ?? null;
-        const shownLineHeight = selectedLineHeight ?? boxLineSpacing(el);
-        layout.content.appendChild(lineSpacingField(
+        const shownLineHeight = selectedLineHeight?.mixed
+          ? null
+          : selectedLineHeight?.value ?? boxLineSpacing(el);
+        const lineHeightField = lineSpacingField(
           shownLineHeight,
           (value) => {
             if (this.onApplyTextSelectionLineHeight?.(value)) return;
@@ -2697,8 +2761,10 @@ export class Inspector {
               if (e.type === 'text') setWholeTextLineHeight(e, null);
             }, { label: 'Use theme line spacing' });
           },
-          shownLineHeight === null ? computedTypography?.lineHeight ?? null : null,
-        ));
+          shownLineHeight === null && !selectedLineHeight?.mixed ? computedTypography?.lineHeight ?? null : null,
+        );
+        if (selectedLineHeight?.mixed) lineHeightField.querySelector('input')!.placeholder = 'Mixed';
+        layout.content.appendChild(lineHeightField);
         wrap.append(typography.section, layout.section, this.textBoxSection(el));
         wrap.appendChild(this.shadowSection([el], 'text'));
         // A box shadow needs a box: it appears once the text has a fill or a border.

@@ -207,7 +207,7 @@ export function agentFixtureDeck(): Deck {
           // A theme class with a margin, and one that frames the picture.
           text('details-nudged', 'Nudged by its class', { x: 120, y: 420, w: 800, h: 80 }, { class: ['role-body', 'nudged'] }),
           { id: 'details-framed', type: 'image', x: 1000, y: 420, w: 400, h: 300, src: 'assets/pic.png', fit: 'cover', class: ['framed'], sourceBox: null },
-          { id: 'details-clip', type: 'video', x: 1450, y: 420, w: 400, h: 225, src: 'assets/clip.mp4', loop: false, muted: false, autoplay: false },
+          { id: 'details-clip', type: 'video', x: 1450, y: 420, w: 400, h: 225, src: 'assets/clip.mp4', loop: false, muted: false, autoplay: false, playbackRate: 0.5 },
           { id: 'details-curve', type: 'shape', shape: 'line', x: 120, y: 800, w: 600, h: 4, control: null, stroke: '#333333' },
           // A rotated brace pointing to its own −y: its depth rides on a data attribute.
           { id: 'details-brace', type: 'shape', shape: 'brace', x: 1200, y: 990, w: 500, h: 2, rot: 30, braceDepth: -50, stroke: '#333333' },
@@ -448,11 +448,21 @@ export class HumanPeer {
     this.socket.send(JSON.stringify(message));
   }
 
-  /** Change the deck as a person would, as one transaction; resolves once the server has it. */
-  async edit(label: string, change: (deck: Deck) => void): Promise<boolean> {
+  /**
+   * Change the deck as a person would, as one transaction; resolves once the
+   * server has it. `textBases` stamps text replacements with the html they
+   * were edited from, as the browser client's live text sync does, so the
+   * server merges them with concurrent typing in the same box.
+   */
+  async edit(label: string, change: (deck: Deck) => void, options: { textBases?: boolean } = {}): Promise<boolean> {
     const next = structuredClone(this.deck);
     change(next);
-    const ops = diffDecks(this.deck, parseDeck(next));
+    const ops = diffDecks(this.deck, parseDeck(next)).map((op) => {
+      if (!options.textBases || op.op !== 'replaceElement' || !('html' in op.element)) return op;
+      const before = this.deck.slides.find((slide) => slide.id === op.slideId)
+        ?.elements.find((element) => element.id === op.elementId);
+      return before && 'html' in before && typeof before.html === 'string' ? { ...op, baseHtml: before.html } : op;
+    });
     if (ops.length === 0) return false;
     const txnId = `human-${randomUUID()}`;
     const echoed = new Promise<void>((resolvePromise, reject) => {

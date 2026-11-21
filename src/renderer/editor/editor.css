@@ -3297,9 +3297,12 @@ button.morph-object-hit.selected-source:hover:not(:disabled) {
 .canvas-host .editor-table-border-preview-left::after { left: 0; }
 .canvas-host .editor-table-border-preview-right::after { right: 0; }
 
-.table-column-buttons { flex-wrap: wrap; }
-.table-column-buttons button { flex: 1 1 calc(50% - 4px); }
-.table-column-buttons button.danger { color: var(--danger); }
+.table-column-buttons,
+.table-row-buttons { flex-wrap: wrap; }
+.table-column-buttons button,
+.table-row-buttons button { flex: 1 1 calc(50% - 4px); }
+.table-column-buttons button.danger,
+.table-row-buttons button.danger { color: var(--danger); }
 .table-border-buttons { flex-wrap: wrap; }
 .table-border-buttons button { flex: 1 1 calc(50% - 4px); }
 .table-border-buttons button[aria-pressed="true"] {
@@ -3315,6 +3318,26 @@ button.morph-object-hit.selected-source:hover:not(:disabled) {
    against the dark pasteboard is what marks where the slide ends. */
 .canvas-host .slide-layer,
 .canvas-host .slide-layer > .slide { overflow: visible; }
+
+/* Off-slide text that would not read on the pasteboard, recoloured in a copy
+   clipped to outside the slide (offSlideText.ts). The copy paints only its
+   recoloured glyphs: no ground, fills or shadows of its own. */
+.offslide-text-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.offslide-text-layer > .slide {
+  overflow: visible;
+  background: none !important;
+}
+.offslide-text-layer .element,
+.offslide-text-layer .element *:not(.katex *) {
+  background: none !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+  outline: none !important;
+}
 
 /* --- filesystem agent panel and scratchpad --- */
 
@@ -3819,6 +3842,21 @@ button.morph-object-hit.selected-source:hover:not(:disabled) {
 .update-notes pre { white-space: pre-wrap; }
 .update-notes-text { white-space: pre-wrap; }
 .update-notes-empty { color: var(--muted); }
+/* Question? Ask your agent!: the prompt to paste, shown whole and selectable. */
+.confirm-dialog.ask-agent-dialog { width: min(600px, calc(100vw - 48px)); }
+.ask-agent-prompt {
+  margin: 0;
+  max-height: min(260px, 40vh);
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
 .paste-theme-description { margin: 0; color: var(--text); }
 .paste-theme-detail { margin: 0; color: var(--muted); line-height: 1.6; }
 .paste-theme-actions { flex-wrap: wrap; }
@@ -3945,6 +3983,15 @@ button.deck-picker-row.active { border-color: var(--accent); }
 .deck-picker-crumb:disabled { opacity: 1; font-weight: 600; }
 .deck-picker-crumb-sep { color: var(--muted, #8a93a6); }
 .deck-picker-folder .deck-picker-name::before { content: '📁  '; }
+/* Private / Public only: the public view is for spotting what should not be public. */
+.deck-picker-scope { display: flex; flex: none; }
+.deck-picker-scope-button + .deck-picker-scope-button { margin-left: -1px; }
+.deck-picker-scope-button[aria-pressed="true"] {
+  position: relative;
+  border-color: var(--accent);
+  background: var(--accent-soft, transparent);
+  color: var(--accent-text, var(--accent));
+}
 /* Import progress. The toolbar's status line is behind this overlay, so an
    upload has to report itself here or it reports itself nowhere. */
 .deck-picker-progress {
@@ -3954,6 +4001,71 @@ button.deck-picker-row.active { border-color: var(--accent); }
   background: var(--panel-2, var(--bg));
   color: var(--text);
   font: 500 11px var(--mono);
+}
+.deck-picker-more { display: none; }
+
+/* On a phone the picker is the whole page, and a row is a name with a line of
+   facts under it — size, last edit, who is in it, owner, access — instead of
+   seven columns. A row's buttons fold away behind its ⋯. */
+@media (max-width: 640px) {
+  .workflow-dialog.deck-picker {
+    --deck-picker-gutter: 12px;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    border: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  }
+  .workflow-overlay:has(> .deck-picker) { padding: 0; }
+  .deck-picker-head { flex-wrap: wrap; gap: 6px; }
+  .deck-picker-head h2 { font-size: 12px; }
+  .deck-picker-trail { flex-basis: 100%; }
+  .deck-picker-columns { display: none; }
+  .deck-picker-list { padding-top: 6px; padding-bottom: 6px; }
+  .deck-picker-group { margin-top: 18px; padding: 0 10px 4px; }
+  .deck-picker-row-group { flex-wrap: wrap; gap: 0; border-bottom: 1px solid var(--line); }
+  .deck-picker-row {
+    display: flex;
+    min-height: 52px;
+    flex-wrap: wrap;
+    align-content: center;
+    gap: 3px 10px;
+    padding: 9px 10px;
+  }
+  .deck-picker-name { flex: 1 0 100%; font-size: 15px; }
+  /* Created: last edit says more on a small screen. */
+  .deck-picker-cell:nth-child(3), .deck-picker-cell:empty { display: none; }
+  .deck-picker-cell { max-width: 100%; }
+  .deck-picker-more {
+    display: block;
+    flex: none;
+    width: 44px;
+    min-height: 44px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--muted, #8a93a6);
+    font-size: 18px;
+  }
+  .deck-picker-row-group.open .deck-picker-more { color: var(--text); }
+  .deck-picker-actions { display: none; width: auto; }
+  .deck-picker-row-group.open .deck-picker-actions {
+    display: flex;
+    flex: 1 0 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 6px;
+    padding: 0 10px 10px;
+  }
+  .deck-picker-actions .deck-picker-share { min-height: 36px; }
+  .deck-picker-crumb { min-height: 32px; }
+  .deck-picker-foot {
+    flex-wrap: wrap;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+  .deck-picker-foot .deck-picker-progress { flex-basis: 100%; }
+  .deck-picker-foot .workflow-actions { flex: 1 0 100%; flex-wrap: wrap; justify-content: stretch; margin-left: 0; }
+  .deck-picker-foot .workflow-actions > * { flex: 1 1 auto; min-height: 40px; }
 }
 .share-dialog-body { display: flex; flex-direction: column; gap: 16px; }
 .share-dialog-owner { margin: 0; color: var(--muted, #8a93a6); }
@@ -4016,6 +4128,125 @@ button.deck-picker-row.active { border-color: var(--accent); }
 .web-export-quality { padding-top: 4px; }
 .web-export-detail { margin: 0; min-height: 3.6em; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .pdf-export-builds { padding: 8px 0 4px; }
+
+/* Open: this computer and the deck servers (openDialog.ts). */
+.open-dialog { width: min(640px, calc(100vw - 56px)); }
+.open-dialog-sources { grid-auto-columns: minmax(0, max-content); }
+.open-dialog-sources .segment-button { padding: 0 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.open-dialog-body { display: flex; flex-direction: column; gap: 10px; min-height: 220px; }
+.open-dialog-message { margin: 0; color: var(--muted); line-height: 1.5; }
+.open-dialog-message.is-error { color: var(--danger); }
+.open-dialog-choose, .open-dialog-body > button { align-self: flex-start; }
+.open-dialog-crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; color: var(--muted); }
+.open-dialog-crumb { border-color: transparent; background: transparent; padding: 2px 4px; }
+.open-dialog-crumb:disabled { opacity: 1; color: var(--text); }
+.open-dialog-list { display: flex; flex-direction: column; max-height: 50vh; overflow: auto; border: 1px solid var(--line); }
+.open-dialog-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  text-align: left;
+}
+.open-dialog-row:last-child { border-bottom: 0; }
+.open-dialog-row:hover:not(:disabled), .open-dialog-row:focus-visible { background: var(--accent-soft); }
+.open-dialog-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.open-dialog-row span { flex: none; color: var(--muted); }
+.open-dialog-row.is-folder strong { color: var(--accent-text); }
+/* Recents: where each deck lives, said the way the toolbar's server chip says it. */
+.open-dialog-row.is-recent { justify-content: flex-start; align-items: baseline; }
+.open-dialog-row.is-recent strong { flex: 1; min-width: 0; }
+.open-dialog-row.is-recent .open-dialog-detail {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.open-dialog-row .open-dialog-origin {
+  display: inline-flex;
+  flex: 0 0 128px;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 10.5px var(--mono);
+}
+.open-dialog-origin::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--muted);
+  border-radius: 50%;
+}
+.open-dialog-row[data-origin="server"] .open-dialog-origin { color: var(--accent-text, var(--accent)); }
+.open-dialog-row[data-origin="server"] .open-dialog-origin::before { border-color: var(--accent); background: var(--accent); }
+.open-dialog-connect { display: flex; gap: 8px; align-items: flex-end; }
+.open-dialog-connect .field { flex: 1; margin-bottom: 0; }
+.open-dialog-spacer { flex: 1; }
+
+/* Upload to server: where a local deck goes, and who may open it there (uploadDialog.ts). */
+.upload-dialog { width: min(520px, calc(100vw - 56px)); }
+.upload-dialog .field { margin-bottom: 0; }
+.upload-dialog-message { margin: 0; color: var(--muted); line-height: 1.5; }
+.upload-dialog-note { min-height: 3em; }
+.upload-dialog-note.is-error { color: var(--danger); }
+.upload-dialog-access { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.upload-dialog-access[hidden], .upload-dialog .field[hidden] { display: none; }
+
+/* Sync changes after offline edits on both sides (mergeDialog.ts). */
+.merge-dialog { width: min(720px, calc(100vw - 56px)); }
+.merge-dialog-lead { margin: 0; color: var(--muted); line-height: 1.5; }
+.merge-dialog-bulk { display: flex; gap: 8px; }
+.merge-dialog-list { display: flex; flex-direction: column; gap: 10px; }
+.merge-item { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--line); }
+.merge-item header { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.merge-item header span { color: var(--muted); }
+.merge-sides { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.merge-side {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 8px;
+  text-align: left;
+}
+.merge-side.is-chosen { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-soft); }
+.merge-side-label { font-weight: 600; }
+.merge-side.is-chosen .merge-side-label { color: var(--accent-text); }
+.merge-side-detail { color: var(--muted); overflow-wrap: anywhere; }
+/* The rail's slide ground: a slide without a background colour is white. */
+.merge-thumb { position: relative; overflow: hidden; max-width: 100%; border: 1px solid var(--line); background: #fff; pointer-events: none; }
+.merge-thumb > .rail-thumb-inner { overflow: hidden; }
+/* Drawn at canvas scale: 18px is about 2px in a 216px miniature. */
+.merge-thumb .merge-changed { outline: 18px solid var(--accent); outline-offset: 6px; }
+.merge-side-changes { margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 0.92em; overflow-wrap: anywhere; }
+.merge-side-changes li + li { margin-top: 2px; }
+.merge-thumb.is-gone { display: grid; place-items: center; background: var(--canvas-ground); color: var(--muted); }
+.merge-dialog-others summary { cursor: pointer; color: var(--muted); }
+.merge-dialog-others[open] summary { margin-bottom: 6px; }
+.merge-auto { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 4px 0; border-top: 1px solid var(--line); }
+.merge-auto > span { min-width: 0; color: var(--muted); }
+.merge-auto strong { color: var(--text); font-weight: 600; }
+.merge-auto-choice { flex: none; width: 180px; }
+.merge-dialog-status { flex: 1; align-self: center; color: var(--muted); }
+.merge-dialog-status.is-error { color: var(--danger); }
+
+/* A server deck's connection, in the toolbar beside its name (main.ts). */
+.remote-status { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; }
+.remote-status[hidden] { display: none; }
+.remote-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.remote-status[data-state="online"]::before { background: var(--green); }
+.remote-status[data-state="offline"]::before { background: var(--yellow); }
+.remote-status[data-state="error"]::before { background: var(--danger); }
+.remote-status button { padding: 0 6px; }
 
 /* Object names in the build, Morph and object lists carry colour swatches so
    two shapes of the same geometry are still told apart at a glance. */
@@ -4862,6 +5093,10 @@ button.cthread-where:disabled { cursor: default; opacity: 1; }
 .video-playback-options > .panel-action { width: auto; margin: 0; padding: 0 10px; height: 26px; font-size: 10.5px; white-space: nowrap; }
 /* A synced group's length: a strip of its own, the width of the panel. */
 .video-playback-options > .sync-length-field { grid-column: 1 / -1; margin: 2px 0 0; }
+/* Speed: a labelled number of its own row, under the flag strip. */
+.video-playback-options > .video-speed-field { grid-column: 1 / -1; margin: 2px 0 0; }
+/* Several videos have no preview button: the flag strip takes the whole row. */
+.video-playback-options > .video-checkbox-grid:first-child { grid-column: 1 / -1; }
 .video-checkbox-grid {
   display: grid;
   grid-auto-flow: column;
@@ -5037,7 +5272,7 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
    EditorCanvas.beginPlayback); the slide and its handles wait underneath. */
 .build-preview-shield { position: fixed; z-index: 30; overflow: hidden; }
 .build-preview-frame { position: absolute; }
-.canvas-host.build-previewing > .stage > :is(.slide-layer, .overlay-layer) { opacity: 0; }
+.canvas-host.build-previewing > .stage > :is(.slide-layer, .offslide-text-layer, .overlay-layer) { opacity: 0; }
 
 .step-label { margin-bottom: 4px; }
 .timeline-row { gap: 6px; padding: 6px; }
@@ -5077,6 +5312,8 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
   border: 1px solid transparent;
   border-radius: 6px;
   cursor: pointer;
+  /* Shift-click picks a range of builds, not a run of their text. */
+  user-select: none;
 }
 .build-overview-row:hover { background: rgb(255 255 255 / 5%); }
 .build-overview-row.selected { border-color: var(--accent); background: var(--accent-soft); }
@@ -5091,6 +5328,8 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
 .build-overview-when { grid-area: when; color: var(--muted); font: 10px var(--mono); }
 /* A build that runs on its own (after or with the one before) sits under it. */
 .build-overview-row:not([data-trigger="click"]) { margin-left: 14px; }
+.build-multi-pick { display: flex; flex-direction: column; gap: 6px; }
+.build-multi-pick .insp-hint { margin: 0; }
 
 /* The picked build's settings: a label column and the control beside it. */
 .build-detail-section .timeline-row { padding: 2px 0 0; }
@@ -5173,7 +5412,7 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
 .design-slide-preview > .slide { position: absolute; inset: 0; }
 .design-slide-preview .text-body,
 .design-slide-preview .text-content { visibility: visible; }
-.canvas-host.design-slide-previewing > .stage > .overlay-layer { visibility: hidden; }
+.canvas-host.design-slide-previewing > .stage > :is(.offslide-text-layer, .overlay-layer) { visibility: hidden; }
 .design-slide-preview-banner {
   position: absolute;
   top: 10px;

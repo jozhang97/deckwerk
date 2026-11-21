@@ -3,6 +3,8 @@ import { existsSync } from 'node:fs';
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { runAgentCli } from '../src/cli/agentCli.js';
+import { loadDeck } from '../src/main/deckStore.js';
 import { validateDeckIntegrity } from '../src/shared/agent.js';
 import { sameSlideContent } from '../src/shared/htmlSlides.js';
 import type { Deck, Slide } from '../src/shared/deck.js';
@@ -240,7 +242,7 @@ for (const kind of BACKENDS) describe.skipIf(!electronBinary)(`an agent working 
     // Everything but the edited box is exactly what it was: the equation is
     // still TeX (not KaTeX's rendered trees), the escaped dollar still
     // escaped, the line break and trailing space still there; the clip still
-    // does not loop, unmute or autoplay; the region is not wrapped in its own
+    // does not loop, unmute or autoplay, and keeps its half speed; the region is not wrapped in its own
     // export box; the class's margin and object-position were not frozen in.
     for (const id of [
       'details-math', 'details-framed', 'details-clip', 'details-curve', 'details-brace', 'details-mirrored', 'details-arrow',
@@ -250,6 +252,20 @@ for (const kind of BACKENDS) describe.skipIf(!electronBinary)(`an agent working 
     }
     expect(element(after, 'details-nudged')).toMatchObject({ x: 120, y: 420, w: 800, h: 80 });
     expect(after.morphFromPrevious).toBe(false);
+  });
+
+  it('lands a speed the agent writes on a clip, and normal speed as none', async () => {
+    const workspace = await open(kind);
+    const page = await exportPage(workspace, 'details');
+    expect(page).toContain('data-playback-rate="0.5"');
+    await workspace.write('speed.html', page.replace('data-playback-rate="0.5"', 'data-playback-rate="2"'));
+    expect(landed(await apply(workspace, 'speed.html'), workspace).changes.replaced).toEqual(['details']);
+    const clip = () => workspace.deck().then((deck) => slideById(deck, 'details').elements
+      .find((element) => element.id === 'details-clip') as Extract<Slide['elements'][number], { type: 'video' }>);
+    expect((await clip()).playbackRate).toBe(2);
+    await workspace.write('normal.html', (await exportPage(workspace, 'details')).replace(' data-playback-rate="2"', ''));
+    landed(await apply(workspace, 'normal.html'), workspace);
+    expect((await clip()).playbackRate).toBeUndefined();
   });
 
   it('lands a mirror the agent writes as a flip, and folds a mirrored line into its ends', async () => {
@@ -888,6 +904,58 @@ describe.skipIf(!electronBinary)('a hosted session', { timeout: 240_000 }, () =>
     await until(async () => sameDeck(await hosted.mirrorDeck(), deck), 'the mirror to converge', 20_000);
     expect(slideById(hosted.human.deck, 'review').elements.map((element) => element.id).sort())
       .toEqual(slideById(deck, 'review').elements.map((element) => element.id).sort());
+  });
+
+  it('sends slide-agent in the server\'s own deck folder through the live session while a person edits', async () => {
+    // Not the mirror: the folder the server serves, where an agent on the
+    // server machine finds the deck. Writing deck.json there raced the
+    // server's autosave, and while a person typed every such change was
+    // written over and reported as applied.
+    hosted = await hostedWorkspace();
+    const w = hosted;
+    const cli = async (...argv: string[]): Promise<{ code: number; json: any; stderr: string }> => {
+      let out = '';
+      let stderr = '';
+      const code = await runAgentCli(argv, { out: (text) => { out += text; }, err: (text) => { stderr += `${text}\n`; }, cwd: w.deckDir });
+      let parsed: unknown = null;
+      try { parsed = JSON.parse(out); } catch { /* not JSON */ }
+      return { code, json: parsed, stderr };
+    };
+    expect((await cli('context', w.deckDir)).json).toMatchObject({ live: true, hostedDeckId: w.deckId });
+
+    let editing = true;
+    let edits = 0;
+    const person = (async () => {
+      while (editing) {
+        await w.human.edit('Edit notes', (deck) => { slideById(deck, 'closing').notes = `Typed ${edits}`; });
+        edits += 1;
+      }
+    })();
+    const inserted = { ...slideById(await w.deck(), 'closing'), id: 'agent-inserted', notes: '', comments: [], elements: [], timeline: [] };
+    await writeFile(join(w.dir, 'txn.json'), JSON.stringify({
+      version: 1, label: 'Agent insert', operations: [{ op: 'insertSlides', afterSlideId: 'review', slides: [inserted] }],
+    }), 'utf8');
+    const transaction = await cli('transaction', 'apply', w.deckDir, join(w.dir, 'txn.json'));
+    await writeFile(join(w.dir, 'new.html'), '<section><h1 class="role-title">Added beside the server</h1></section>', 'utf8');
+    const page = await cli('apply', w.deckDir, '--html', join(w.dir, 'new.html'));
+    editing = false;
+    await person;
+
+    for (const result of [transaction, page]) {
+      expect(result.code, `${result.stderr} ${JSON.stringify(result.json)}`).toBe(0);
+      expect(result.json).toMatchObject({ status: 'applied', live: true });
+    }
+    expect(edits).toBeGreaterThan(2);
+    const deck = await w.deck();
+    expect(slideById(deck, 'closing').notes).toBe(`Typed ${edits - 1}`);
+    expect(deck.slides.map((slide) => slide.id)).toContain('agent-inserted');
+    expect(deck.slides.some((slide) => plainText(slide).includes('Added beside the server'))).toBe(true);
+    expect(validateDeckIntegrity(deck)).toEqual([]);
+    // And the server's own save carries both, rather than one over the other.
+    await until(async () => {
+      const disk = await loadDeck(w.deckDir);
+      return disk.slides.some((slide) => slide.id === 'agent-inserted') && slideById(disk, 'closing').notes === `Typed ${edits - 1}`;
+    }, 'the server to save both edits', 10_000);
   });
 
   it('answers every ./deck verb through the bridge the server hands out', async () => {

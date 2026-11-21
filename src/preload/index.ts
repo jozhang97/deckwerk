@@ -36,6 +36,14 @@ import type {
   PresentationState,
   PresentOptions,
   RasterResult,
+  RecentDeckEntry,
+  RemoteDeckBinding,
+  RemoteListingResult,
+  RemoteLocalCopy,
+  RemoteServerEntry,
+  RemoteServerInfo,
+  RemoteUploadRequest,
+  RemoteUploadResult,
   RasterSaveRequest,
   RasterTarget,
   DisplayInfo,
@@ -45,6 +53,8 @@ import type {
   VideoPosterRequest,
   VideoPosterResult,
   WebExportRequest,
+  ShowSlideRequest,
+  TutorialInfo,
 } from '@shared/ipc.js';
 
 /**
@@ -96,6 +106,15 @@ const api = {
   openDeck: (operationId?: string): Promise<DeckSession | null> =>
     ipcRenderer.invoke(IPC.deckOpen, operationId),
   getDeck: (): Promise<DeckSession | null> => ipcRenderer.invoke(IPC.deckGet),
+  /** Null when the tutorial opened in a window of its own (or was already open there). */
+  openTutorial: (operationId?: string, slideId?: string): Promise<DeckSession | null> =>
+    ipcRenderer.invoke(IPC.tutorialOpen, operationId, slideId),
+  tutorialInfo: (): Promise<TutorialInfo> => ipcRenderer.invoke(IPC.tutorialInfo),
+  /** Null when this installation has no tutorial to point an agent at. */
+  tutorialPrompt: (): Promise<string | null> => ipcRenderer.invoke(IPC.tutorialPrompt),
+  tutorialShippedDeck: (): Promise<Deck> => ipcRenderer.invoke(IPC.tutorialShippedDeck),
+  /** The slide a tutorial link asked this deck to open on, if any; asked once per open. */
+  takeShowSlide: (dir: string): Promise<string | null> => ipcRenderer.invoke(IPC.deckTakeShowSlide, dir),
   /** Null when the deck went to a window of its own instead of this one. */
   openDeckPath: (dir: string): Promise<DeckSession | null> =>
     ipcRenderer.invoke(IPC.deckOpenPath, dir),
@@ -197,6 +216,31 @@ const api = {
   getAgentPanelState: (): Promise<AgentPanelState> =>
     ipcRenderer.invoke(IPC.agentPanelGetState),
 
+  /** Deck servers (remoteDecks.ts): the list, the decks on one, opening one as a mirror. */
+  remoteServers: (): Promise<RemoteServerEntry[]> => ipcRenderer.invoke(IPC.remoteServers),
+  addRemoteServer: (url: string, name?: string): Promise<RemoteServerEntry & { info: RemoteServerInfo }> =>
+    ipcRenderer.invoke(IPC.remoteServerAdd, url, name),
+  removeRemoteServer: (id: string): Promise<void> => ipcRenderer.invoke(IPC.remoteServerRemove, id),
+  remoteServerInfo: (serverId: string): Promise<RemoteServerInfo> => ipcRenderer.invoke(IPC.remoteServerInfo, serverId),
+  remoteListing: (serverId: string): Promise<RemoteListingResult> => ipcRenderer.invoke(IPC.remoteListing, serverId),
+  /** Put the open deck (`dir`) on a server; its folder then mirrors the server deck. */
+  uploadDeckToServer: (dir: string, request: RemoteUploadRequest, operationId?: string): Promise<RemoteUploadResult> =>
+    ipcRenderer.invoke(IPC.remoteUpload, dir, request, operationId),
+  /** The decks opened last, newest first. */
+  recentDecks: (): Promise<RecentDeckEntry[]> => ipcRenderer.invoke(IPC.recentDecks),
+  openRemoteDeck: (
+    serverId: string,
+    deckId: string,
+    operationId?: string,
+    options?: { offline?: boolean },
+  ): Promise<DeckSession | null> => ipcRenderer.invoke(IPC.remoteOpen, serverId, deckId, operationId, options),
+  remoteLocalCopies: (serverId: string): Promise<RemoteLocalCopy[]> => ipcRenderer.invoke(IPC.remoteLocalCopies, serverId),
+  remoteBinding: (dir: string): Promise<RemoteDeckBinding | null> => ipcRenderer.invoke(IPC.remoteBinding, dir),
+  saveRemoteBaseline: (dir: string, baseline: { deck: Deck; themeCss: string; seq: number }): Promise<void> =>
+    ipcRenderer.invoke(IPC.remoteBaselineSave, dir, baseline),
+  syncRemoteFiles: (dir: string): Promise<void> => ipcRenderer.invoke(IPC.remoteFilesSync, dir),
+  fetchRemoteAssets: (dir: string, deck: Deck): Promise<string[]> => ipcRenderer.invoke(IPC.remoteAssetsFetch, dir, deck),
+
   /** Start sharing while keeping this native editor connected as the host. */
   startCollab: (opts: CollabStartRequest): Promise<AgentSessionConnection> =>
     ipcRenderer.invoke(IPC.collabStart, opts),
@@ -218,6 +262,10 @@ const api = {
     on(IPC.presentCommand, fn),
   onPresentState: (fn: (state: PresentationState) => void): (() => void) =>
     on(IPC.presentState, fn),
+  editPresentNotes: (slideId: string, notes: string): void =>
+    ipcRenderer.send(IPC.presentNotesEdit, { slideId, notes }),
+  onPresentNotesEdit: (fn: (edit: { slideId: string; notes: string }) => void): (() => void) =>
+    on(IPC.presentNotesEdit, fn),
   onPresentEnded: (fn: (slideIndex: number) => void): (() => void) =>
     on(IPC.presentEnded, fn),
 
@@ -236,6 +284,8 @@ const api = {
 
   onDeckState: (fn: (s: DeckSession) => void): (() => void) =>
     on(IPC.deckState, fn),
+  onShowSlide: (fn: (request: ShowSlideRequest) => void): (() => void) =>
+    on(IPC.deckShowSlide, fn),
   onThemeCss: (fn: (css: string) => void): (() => void) => on(IPC.themeCss, fn),
   onAgentRequest: (fn: (request: AgentRequest) => void): (() => void) =>
     on(IPC.agentRequest, fn),

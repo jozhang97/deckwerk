@@ -89,6 +89,114 @@ is unrecoverable. Replacements are logged by id only. It rotates to
 is never mirrored, served or downloaded. `slide-agent history <deck folder>
 --deleted` reads it; the format is described in `AGENTS.md`.
 
+## Server decks on the desktop
+
+The desktop app edits decks that live on a standalone server, and keeps
+editing them when the connection drops.
+
+- **Connect.** Open → **+ Server…** (or the welcome screen's *Open from a
+  server*, or Open ▾ → *Connect to Server…*) takes an address:
+  `100.68.22.127` (port 5800 assumed), `host:port`, or an `https://` tailnet
+  URL. Servers are remembered per user (`remote-servers.json` in the app's
+  user data). Once one is known, **Open** shows one dialog with *Recents*,
+  *This computer* and a tab per server, browsing the server's folders like its
+  web picker; with none, Open goes straight to the folder picker as before.
+- **Recents.** The first tab lists the decks opened last (`recent-decks.json`
+  in the user data, `src/main/recentDecks.ts`; the tutorial is left out), from
+  this computer and from servers together. Each row says which it is: *This
+  computer* with the folder it is in, or the server's name, in the accent
+  colour, with the folder it is filed in there. Whether a folder mirrors a
+  server deck is read from the folder when the list is shown, so a deck
+  uploaded since it was last opened is listed as the server deck it now is. A
+  recent deck opens by its folder, without asking any server: a server deck's
+  copy opens at once, online or not, and connects once it is open.
+- **A mirror, not a window onto the server.** Opening a server deck makes (or
+  refreshes) an ordinary deck folder at
+  `~/.deckwerk/remote/<host>/<deck id>` (`DECKWERK_REMOTE_ROOT` overrides it)
+  and opens that in the ordinary editor, so offline editing, ffmpeg trims and a
+  local agent in `edit/` all work on it. `.deckwerk-remote/` beside the deck
+  records which server deck it mirrors and the **baseline**: the last server
+  state this machine saw (`base.json`, plus seq and theme in `sync.json`). The
+  editor writes the baseline right after the deck.json it belongs with, from
+  the same instant, so a crash never leaves a baseline newer than the deck.
+  Reopening the folder any way (Open, the command line) re-binds it. **Save
+  As** leaves `.deckwerk-remote/` behind: the copy is a deck of its own, not a
+  second mirror writing into the deck it was copied from. Files
+  come down six at a time — over a long route one stream is held to a
+  fraction of the line by the round trip — and a dropped connection is retried
+  per file, so one reset does not fail a 1.5 GB first open; an open that did
+  fail resumes, fetching only what is missing.
+- **Upload.** A deck that lives on this computer goes the other way with
+  **Save As… → Upload to Server…** (File → Upload to Server… in the compact
+  toolbar; absent for a deck that is already a server deck). The dialog asks
+  for the server, one of its folders and a name (the folder's name, cleaned as
+  the server will clean it, and refused while a deck or folder there has it),
+  and, on an `--access` server, who can open it: *Restricted* (the server's
+  default for anything new) or *Everyone on this server*, to view or to edit.
+  `uploadDeck` (`src/main/remoteDecks.ts`) sends deck.json, the stylesheet
+  and whatever else the two point at outside `assets/` as a deck archive to
+  `/api/import-deck`, then binds the folder — the one the deck is in, not a
+  copy under `~/.deckwerk/remote` — by writing `.deckwerk-remote/` into it,
+  and only then streams the files under `assets/` up, three at a time, those
+  the slides show first. A connection that drops among them leaves a mirror
+  with uploads outstanding, which the next sync sends; nothing else in the
+  folder (raw footage, exports) is uploaded. The window then joins the deck
+  as if it had been opened from the server. `linked-folders.json` in the
+  mirror root remembers folders that mirror a deck from outside it, most
+  recently used first — any such folder is added when it is opened — so the
+  Open dialog lists that copy as available offline and opens it rather than
+  downloading a second one.
+- **Live.** The editor's own `CollabBridge` joins the room as an ordinary
+  peer, with live text sync on, presence and cursors. The editor's content
+  security policy only allows sockets to 127.0.0.1, so it connects through a
+  relay in the main process (`RemoteRelay` in `src/main/remoteDecks.ts`) that
+  only forwards to saved servers, behind a random token. The relay pings the
+  server every 10 s and drops the editor's socket when a beat goes unanswered,
+  so a route that died silently reads as offline in seconds. Files: the mirror
+  pulls what the server has (`/api/agent-mirror/files`, by sha256) and pushes
+  what lands in its own `assets/` (an import, a trim, a paint) — on open, on
+  every reconnect, and when `assets/` changes; a collaborator's new picture is
+  fetched when the deck that refers to it arrives, then redrawn.
+- **Offline.** The toolbar chip says *Offline · edits kept on this computer*;
+  editing continues and is saved to the mirror as usual. Clicking the chip
+  retries at once. A server that cannot be reached still has its tab in the
+  Open dialog: *You are offline. The following presentations are available
+  offline and will be synced whenever you are online again:* and the decks
+  already copied to this computer (`listMirrors`, from each mirror's
+  `sync.json`), which open at once without asking the server and connect when
+  it is back. With no network at all that list is shown immediately; otherwise
+  it appears after 1.2 s without an answer (*Still looking for …*), since an
+  unreachable server can take the whole 15 s request timeout to be told from
+  a slow one, and is replaced by the server's listing if that arrives. The
+  tab asks again when the system reports the network back. Online, the
+  listing marks those decks *available offline*.
+- **Reconnect = three-way merge** (`src/shared/deckMerge.ts`) of the baseline,
+  the deck on screen and the server's deck. Per slide: changed on one side
+  only → that side; changed on both → merged object by object when the two
+  touched different objects (and different slide fields — notes, name,
+  builds…), otherwise a **conflict**; deleted on one side and changed on the
+  other → conflict; added on either side → kept, after its predecessor in its
+  own copy. Slide order is one item, a conflict only when both sides
+  rearranged differently. Deck settings and theme.css are one item each.
+  Comments always merge by id. With no conflict the merge is silent; with one,
+  the **Sync changes** dialog shows each conflicting slide as two miniatures,
+  *Your version* and *Server version*, to pick from (or *Keep all mine* /
+  *Take all from server*), and lists everything that merged automatically,
+  each still overridable to one side. The result goes up as one transaction
+  (`Synchronize offline edits`) on top of whatever the server holds by then.
+  If the link drops again while the dialog is open, the choice is kept and
+  sent on the next connection without asking again.
+- The **Collaborate** button is hidden for a server deck: it is already shared.
+
+Tests: `test/deckMerge.test.ts` (the merge, with a seeded property walk),
+`test/remoteDeckSync.test.ts` (an offline replica against a real server
+through a link it cuts, plus a seeded fuzz walk: `REMOTE_FUZZ_SEEDS`,
+`REMOTE_FUZZ_STEPS`), `test/remoteDecks.test.ts` (mirrors, files, uploading a
+local deck, the relay and its heartbeat), `test/recentDecks.test.ts`,
+`test/openDialog.test.ts` and `test/uploadDialog.test.ts` (the two dialogs
+against a scripted desktop) and `test/remoteDeckDesktopBrowser.test.ts` (the
+real desktop app end to end; `REMOTE_SHOTS=<dir>` keeps screenshots).
+
 ## Running a standalone server
 
 Build the browser client once (rebuild after pulling client changes):
@@ -384,9 +492,11 @@ the participant id.
   folder's `index.html` in any browser, with or without DeckWerk installed.
   The live session is flushed first, so the bundle is what everyone currently
   sees. The server's own build (`npm run build:collab`, run by `npm run
-  collab` before it starts) builds the export player too; a server started
-  some other way without it (`npm run build:export`) says so instead of
-  downloading a broken archive.
+  collab` before it starts) builds the export player too, stamped with the
+  sources it came from; a server running from a checkout whose player is
+  missing or stamped with other sources builds a current one first
+  (src/main/exportPlayer.ts), and a built server without one says so
+  instead of downloading a broken archive.
 - **Save As… → Lossy export → PDF…** — opens a print tab (`print.html?deck=…&mode=…`) that
   builds the same `.pdf-page` document the desktop exporter renders — one page
   per slide, or per build stage when "Include each stage of builds" is ticked —
@@ -480,9 +590,22 @@ exposed for console driving.
   reverts other people's work; if a peer deleted what you were about to
   restore, that part is skipped.
 - Persistence mirrors the desktop autosave: debounced whole-file writes of
-  `deck.json` by the server, which also watches the folder — an offline
-  `slide-agent apply`, a git checkout, or a hand edit broadcasts a resync to
-  every client.
+  `deck.json` by the server, which also watches the folder. A `deck.json`
+  written by anything else (a git checkout, a script, a hand edit) is merged
+  into the live deck three ways — the file, the live deck with edits not yet
+  saved, and whichever recent save the file was most likely written from
+  (`src/server/diskMerge.ts`) — and goes to every client as an ordinary
+  transaction, so nothing a client has not had confirmed, and nobody's undo
+  history, is lost. Where both changed the same object the live edit wins
+  and the file stays restorable from the deck's versions. A save never
+  writes over a change on disk it has not merged yet.
+- `slide-agent` does not write there at all. The server announces itself in
+  `.deckwerk-server.json` at the root of the folder it serves (loopback URL,
+  pid, a token), and the CLI sends changes to `/api/agent-host/context` and
+  `/api/agent-host/request`, the agent protocol the desktop editor answers
+  through files, answered against the live session (`src/cli/hostedDeck.ts`,
+  `src/main/agentHost.ts`). Desktop-hosted single-deck sessions do not
+  announce themselves: the desktop editor is live for its agents already.
 
 ## Media
 
@@ -493,14 +616,14 @@ ffprobe. Videos stream with HTTP Range support, so playback and seeking work
 in every tab. The inspector's non-destructive in/out trim sliders work
 unchanged — they write `start`/`end` on the element and sync like any edit.
 
-The desktop-only media features are the two destructive editors — "Edit w/
-ffmpeg…" trim-and-crop and "Rasterize & paint…" — whose buttons are hidden in
-the browser because nothing sets the inspector hooks that reveal them.
+The desktop-only media feature is the destructive "Rasterize & paint…"
+editor, whose button is hidden in the browser because nothing sets the
+inspector hook that reveals it. (The ffmpeg trim-and-crop window is retired on
+every platform: nothing opens it.)
 
 ## Not in the browser client (v1)
 
-The destructive "Edit w/ ffmpeg…" trim-and-crop and "Rasterize & paint…"
-media editors. Like the desktop app, there is no
+The destructive "Rasterize & paint…" media editor. Like the desktop app, there is no
 raw-CSS sidebar tab; theme.css is edited on disk (the server watcher
 broadcasts it) or through theme adoption. The full list, with what each one
 would take, is in [Desktop → web feature parity](desktop-web-parity.md).
@@ -524,8 +647,8 @@ would take, is in [Desktop → web feature parity](desktop-web-parity.md).
     deliberate deferral, not an oversight.
 - Do not open the same deck folder in the Electron app while the collab
   server is hosting it: both are debounced whole-file writers and will
-  overwrite each other. Use the browser client, or an offline
-  `slide-agent apply` (the watcher picks it up). The desktop app enforces the
+  overwrite each other. Use the browser client, or `slide-agent` on the
+  folder (it goes through the server). The desktop app enforces the
   same rule among its own windows: opening a deck a window already has open
   brings that window forward rather than opening it twice.
 - Timeline (build) edits are slide-granular: two people editing builds on the
@@ -571,3 +694,18 @@ would. Every move goes back as `remote-state`. The server keeps the pairs
 (`Room.remotes`) and relays a command only along one the presenter offered
 and the remote accepted. `remote-end` from either side, or either socket
 closing, ends it. Nothing about it is persisted.
+
+The phone can also ask. While anyone presents the deck, the phone client's
+bar shows **Remote**, which sends `remote-request`. The server passes it to
+one surface of the show (the asker's own login first, then the most recent),
+with `sameUser` set when access control is on and both pages are the same
+login. A presentation offers its own person's phone the remote at once, and
+that phone takes an offer that answers its request without asking again.
+Anybody else is marked "Asks for it" in the presenter's list (R) for the
+presenter to give it.
+
+The remote view, like every preview on the phone, draws video slides from
+the server's stills (`/api/video-still`) and never loads a clip itself
+(`setPreviewInPageCapture(false)` in `mobile.ts`). A phone that loaded the
+next slide's video to paint its preview held up the clicks on every slide
+with a large clip.

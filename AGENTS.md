@@ -252,7 +252,9 @@ there too — the list is a checklist, not an error. Scope it to the slides you
 are actually editing with `--slide <id|number|a-b>` (repeatable, or comma-separated) or
 `--selected`; structural `errors` stay deck-wide either way. It also lists
 `mathProblems`: text elements whose `$`/`$$` maths opens and never closes,
-which the slide shows as raw TeX (usually a `<` inside maths; see below).
+which the slide shows as raw TeX (usually a `<` inside maths; see below). And
+`buildProblems`: equation term builds with nothing to step through, because
+the equation marks no terms (`\step{1}{…}`) or not the one the build names.
 
 **Write semantic markup; put reusable classes in `theme.css`.** The walk bakes
 layout from any CSS, keeps a dissolving container's paint (background, border,
@@ -297,7 +299,9 @@ turns into, not a list of things to opt into.
   seconds; an exported `<video src>` also carries `#t=<start>` so the page
   previews the right frame. The file is the `src` without that fragment, and
   `deck.json` never stores one: a hand-written `src="x.mp4#t=15,20"` with no
-  `data-trim` lands as `src: "x.mp4"`, `start: 15`, `end: 20`.
+  `data-trim` lands as `src: "x.mp4"`, `start: 15`, `end: 20`. A clip's
+  speed is `data-playback-rate="2"` (`playbackRate` in `deck.json`; absent
+  means normal speed), so don't re-encode a clip just to speed it up.
 - **Crops** — `object-fit: cover/contain` with an `object-position` that is
   not the default is a crop, and it is measured into the deck's own
   `sourceBox`, so the framing you chose is what the crop tool picks up when
@@ -571,7 +575,7 @@ per change the server accepted, so that when something vanishes there is a
 record of who or what removed it, and the removed content itself. Each line
 has the time, the session `seq` (restarting when the server reopens the deck),
 `kind` (`txn`, or `replace` for a deck.json written on disk behind the
-server), the `label`, the `author` (the display name the room saw; on an
+server and merged into the live deck), the `label`, the `author` (the display name the room saw; on an
 access-controlled server the `login` it was admitted under; the peer's
 `clientId`; `agent` for a bridge or the HTTP agent API; `via`
 `socket`/`http`/`disk`/`server`; `agentFor`, the participant a bridge speaks
@@ -815,9 +819,12 @@ required.
 
 `live` tells you which world you are in:
 
-- **`live: true`** — the editor is open. Its in-memory deck is the real
-  document, `deckRevision` is that deck's hash (which may lead `diskRevision`
-  by an autosave), and transactions are applied by the editor itself.
+- **`live: true`** — the editor is open, or a collaboration server hosts the
+  deck. Its in-memory deck is the real document, `deckRevision` is that
+  deck's hash (which may lead `diskRevision` by an autosave), and
+  transactions are applied by the editor or the server itself. A hosted deck
+  also reports `hostedBy` (the server) and `hostedDeckId`; the selection is
+  that of the person in it.
 - **`live: false`** — no editor. `deck.json` is the document. Any selection
   shown is a *hint* recovered from the last session's sidecar, filtered to ids
   that still exist; `stale: true` means that sidecar was left behind by an app
@@ -826,6 +833,20 @@ required.
 The sidecar lives in `~/.deckwerk/runtime/<deck>-<hash>/`, never in the
 deck folder — it is ephemeral state, not part of the document, and it stays out
 of git.
+
+**A deck on a collaboration server is never edited on disk.** A server
+writes `.deckwerk-server.json` at the root of the folder it serves (on this
+machine, `/srv/deckwerk/decks`), and `slide-agent` run on a deck folder under
+it — `context`, `apply --html`, `transaction apply` and everything built on
+it, `history --restore` — sends its change to the server, which applies it
+as a transaction in the live session: everyone in the deck sees it land, it
+is in their History, and nothing anybody is typing is lost. Writing
+`deck.json` beside a running server raced its autosave: while someone typed,
+the change was written over and still reported as applied. If the server is
+running but does not answer, `slide-agent` says so and changes nothing.
+Anything else that writes `deck.json` there (a script, git) is merged into
+the live deck; a change to an object someone is editing at that moment
+loses to theirs, and the file as written stays in the deck's versions.
 
 ### Computed scenes, for inspection rather than authoring
 
@@ -871,7 +892,8 @@ slide-agent render ~/talks/millivid --selected \
 `--annotate` outlines every object and labels it with its element id, marking
 the selection in red. `--built` fires every build so the finished slide is
 captured rather than its opening state. Renders go through the same player the
-projector runs, and need `npm run build:export` once.
+projector runs, built from this checkout's own sources: the first render after
+a code change takes a second or two longer while it builds.
 
 ### Change the deck with a transaction — the fallback path
 
