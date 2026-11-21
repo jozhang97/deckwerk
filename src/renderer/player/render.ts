@@ -1100,6 +1100,8 @@ function renderPendingPlaceholder(src: string): HTMLElement {
   const box = document.createElement('div');
   box.className = 'pending-asset';
   box.dataset.pendingToken = pendingToken(src) ?? '';
+  const name = pendingName(src);
+  box.classList.toggle('pending-pdf', /\.pdf$/i.test(name));
 
   const preview = document.createElement('div');
   preview.className = 'pending-asset-preview';
@@ -1111,7 +1113,7 @@ function renderPendingPlaceholder(src: string): HTMLElement {
   ring.className = 'pending-asset-ring indeterminate';
   const label = document.createElement('div');
   label.className = 'pending-asset-label';
-  label.textContent = pendingName(src);
+  label.textContent = name;
   const status = document.createElement('div');
   status.className = 'pending-asset-status';
   status.textContent = 'Uploading…';

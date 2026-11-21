@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createDeck, importAsset, originalAssetPath } from '../src/main/deckStore.js';
 import { probeMedia, videoCodec } from '../src/main/ffmpeg.js';
 import { classifyMediaName, originalDownloadName } from '../src/shared/media.js';
-import { MEDIA_FIXTURES, writeMediaFixtures } from './support/mediaFixtures.js';
+import { MEDIA_FIXTURES, pdfFixture, writeMediaFixtures } from './support/mediaFixtures.js';
 
 /**
  * The format matrix behind drag-and-drop and paste, at the one place both
@@ -115,6 +115,7 @@ describe('media import formats', () => {
 
     expect(asset.kind).toBe('image');
     expect(asset.src).toMatch(/\.page-1\.svg$/);
+    expect(asset.pdfViewer).toBeUndefined();
     expect([asset.width, asset.height]).toEqual([140, 105]);
     const svg = await readFile(join(deckDir, asset.src), 'utf8');
     expect(svg).toContain('<svg');
@@ -136,6 +137,30 @@ describe('media import formats', () => {
     expect(names).toHaveLength(2);
     const original = names.find((name) => name.endsWith('.pdf'))!;
     expect(await readFile(join(deckDir, 'assets', original))).toEqual(await readFile(source));
+  });
+
+  it('stages every PDF page in order and reuses the self-contained viewer', async () => {
+    const deckDir = join(root, 'deck-pdf-viewer');
+    await createDeck(deckDir);
+    const source = join(root, 'document.pdf');
+    await writeFile(source, pdfFixture(3));
+    const messages: string[] = [];
+    const asset = await importAsset(deckDir, source, (_, message) => {
+      if (message) messages.push(message);
+    });
+    expect(asset.pdfViewer).toMatchObject({ title: 'document.pdf', src: /^assets\/web\/.+\.html$/ });
+    const viewer = join(deckDir, asset.pdfViewer!.src);
+    const before = await stat(viewer);
+    const html = await readFile(viewer, 'utf8');
+    expect(messages).toEqual(['Reading document.pdf', ...[1, 2, 3].map(n => `Rendering PDF page ${n} of 3`)]);
+    const pages = [...html.matchAll(/alt="(Page \d of 3)"[^>]+src="data:image\/svg\+xml;base64,([^"]+)"/g)];
+    expect(pages.map(([, name]) => name)).toEqual(['Page 1 of 3', 'Page 2 of 3', 'Page 3 of 3']);
+    const figures = pages.map(([, , data]) => Buffer.from(data, 'base64').toString('utf8'));
+    expect(figures[0]).toBe(await readFile(join(deckDir, asset.src), 'utf8'));
+    expect(figures.map(svg => svg.match(/stroke="(#[\da-f]+)"/i)?.[1]?.toLowerCase()))
+      .toEqual(['#ff0000', '#00ff00', '#0000ff']);
+    expect(await importAsset(deckDir, source)).toEqual(asset);
+    expect((await stat(viewer)).mtimeMs).toBe(before.mtimeMs);
   });
 
   it('rejects a malformed PDF without caching an empty figure', async () => {

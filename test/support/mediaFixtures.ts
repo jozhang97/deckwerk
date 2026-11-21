@@ -327,7 +327,7 @@ async function writeFixture(entry: MediaFixture, path: string): Promise<void> {
       await writeFile(path, SVG, 'utf8');
       return;
     case 'paper.pdf':
-      await writeFile(path, minimalPdf());
+      await writeFile(path, pdfFixture());
       return;
     case 'notes.txt':
       await writeFile(path, 'Not media.\n', 'utf8');
@@ -345,18 +345,24 @@ const SVG = [
 ].join('');
 
 /**
- * A one-page PDF, hand-assembled because nothing in the toolchain writes one.
+ * A small vector PDF with a differently colored rectangle on each page.
  * Byte offsets in the xref table have to match the body exactly, so they are
  * measured rather than written down.
  */
-function minimalPdf(): Buffer {
-  const content = '1 0 0 RG 4 w 10 10 120 85 re S\n';
+export function pdfFixture(pageCount = 1): Buffer {
+  const pageIds = Array.from({ length: pageCount }, (_, index) => 3 + index * 2);
+  const colors = ['1 0 0', '0 1 0', '0 0 1'];
   const objects = [
     '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
-    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
-    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 105] /Contents 4 0 R >>\nendobj\n',
-    `4 0 obj\n<< /Length ${content.length} >>\nstream\n${content}endstream\nendobj\n`,
+    `2 0 obj\n<< /Type /Pages /Kids [${pageIds.map(id => `${id} 0 R`).join(' ')}] /Count ${pageCount} >>\nendobj\n`,
   ];
+  for (const [index, id] of pageIds.entries()) {
+    const content = `${colors[index % colors.length]} RG 4 w 10 10 120 85 re S\n`;
+    objects.push(
+      `${id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 105] /Contents ${id + 1} 0 R >>\nendobj\n`,
+      `${id + 1} 0 obj\n<< /Length ${content.length} >>\nstream\n${content}endstream\nendobj\n`,
+    );
+  }
   let body = '%PDF-1.4\n';
   const offsets: number[] = [];
   for (const object of objects) {

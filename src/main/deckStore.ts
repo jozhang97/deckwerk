@@ -14,7 +14,7 @@ import { convertImageToPng, isWebSafeCodec, probeMedia, transcodeToH264, videoCo
 import { needsFastStart, writeFastStart } from './mp4FastStart.js';
 import { copyFileStreamed } from './copyFileStreamed.js';
 import { convertHeicToPng } from './heic.js';
-import { convertPdfToSvg } from './pdfImport.js';
+import { convertPdf } from './pdfImport.js';
 
 /**
  * Reading and writing deck folders.
@@ -254,7 +254,7 @@ export function classifyMedia(path: string): 'image' | 'video' | null {
 export async function importAsset(
   deckDir: string,
   sourcePath: string,
-  onProgress?: (ratio: number | null) => void,
+  onProgress?: (ratio: number | null, message?: string) => void,
 ): Promise<ImportedAsset> {
   const kind = classifyMedia(sourcePath);
   if (!kind) throw new Error(`Unsupported media type: ${basename(sourcePath)}`);
@@ -279,15 +279,16 @@ export async function importAsset(
   // importer does, and leave the original in place as the hashed source.
   let finalName = name;
 
-  // A native PDF plugin can exist without painting (including during export).
-  // SVG preserves the figure's vectors and uses the normal image pipeline.
-  // Keep the original alongside it so the source document is never lost.
+  // Deck surfaces render the first page as ordinary vector artwork. A
+  // multi-page PDF also gets a self-contained interactive viewer.
   if (ext === '.pdf') {
     const converted = importedAssetName.pdfFigure(stem, hash);
-    onProgress?.(null);
-    const dimensions = await convertPdfToSvg(dest, join(assetsDir, converted));
+    onProgress?.(null, `Reading ${basename(sourcePath)}`);
+    const pdf = await convertPdf(dest, join(assetsDir, converted), {
+      assetsDir, stem, hash, title: basename(sourcePath),
+    }, onProgress);
     onProgress?.(1);
-    return { src: `${ASSETS_DIR}/${converted}`, kind, ...dimensions, duration: null };
+    return { src: `${ASSETS_DIR}/${converted}`, kind, ...pdf, duration: null };
   }
 
   // iPhone photos: HEIC out to PNG. Decoding is not free, and there is no

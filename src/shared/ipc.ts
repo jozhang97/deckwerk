@@ -374,6 +374,8 @@ export interface ImportedAsset {
   height: number | null;
   /** Seconds, for video only. */
   duration: number | null;
+  /** Multi-page PDF viewer. `src` above is the first-page preview. */
+  pdfViewer?: { src: string; title: string };
 }
 
 export interface ImportedPymol {
@@ -393,6 +395,7 @@ export interface AssetImportProgress {
   phase: 'upload' | 'processing';
   /** 0..1, or null when the phase has no measurable progress. */
   ratio: number | null;
+  message?: string;
 }
 
 /** A phase update for a renderer-initiated operation that may take a while. */

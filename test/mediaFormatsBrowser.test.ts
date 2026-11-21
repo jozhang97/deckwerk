@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { saveDeck } from '../src/main/deckStore.js';
 import { startCollabServer, type RunningCollabServer } from '../src/server/collabServer.js';
-import { emptyDeck } from '../src/shared/deck.js';
+import { emptyDeck, type Deck } from '../src/shared/deck.js';
 import {
   Cdp,
   electronBinary,
@@ -15,7 +15,7 @@ import {
   type RunningBrowser,
 } from './support/browserSession.js';
 import { collabClientDir } from './support/collabClient.js';
-import { fixture, writeMediaFixtures } from './support/mediaFixtures.js';
+import { fixture, pdfFixture, writeMediaFixtures } from './support/mediaFixtures.js';
 import { PAINT_READER, READ_MEDIA, type Landed, type Painted } from './support/mediaPaint.js';
 
 /**
@@ -249,6 +249,27 @@ describe.skipIf(!electronBinary)('media formats in the browser', () => {
       expect(painted[0].detail, `decoded size of pasted ${name}`).toBe('64x48');
     }
   }, 300_000);
+
+  it('pastes a multi-page PDF as an interactive viewer on a hosted deck', async () => {
+    const content = pdfFixture(3).toString('base64');
+    await editor!.evaluate(`(() => {
+      const bytes = Uint8Array.from(atob(${JSON.stringify(content)}), c => c.charCodeAt(0));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([bytes], 'document.pdf', { type: 'application/pdf' }));
+      window.dispatchEvent(new ClipboardEvent('paste', {
+        bubbles: true, cancelable: true, clipboardData: transfer,
+      }));
+    })()`);
+    const web = await eventually(async () => {
+      const response = await fetch(`http://127.0.0.1:${server!.port}/api/deck?deck=${DECK_ID}`);
+      const deck = await response.json() as Deck;
+      return deck.slides[0].elements.filter(element => element.type === 'web').find(element => element.title === 'document.pdf');
+    }, 'pasted PDF viewer reached the server', element => element?.type === 'web');
+    expect(web).toMatchObject({ type: 'web', poster: expect.stringMatching(/\.page-1\.svg$/), interactive: true });
+    const response = await fetch(`http://127.0.0.1:${server!.port}/decks/${DECK_ID}/${web!.src}`);
+    expect(response.ok).toBe(true);
+    expect(await response.text()).toContain('Page 3 of 3');
+  }, 60_000);
 });
 
 describe.skipIf(electronBinary)('media formats in the browser (skipped)', () => {

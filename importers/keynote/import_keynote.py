@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import functools
 import hashlib
@@ -5052,8 +5053,8 @@ def import_key(
         pkg.close()
 
 
-def pdf_figure(source: Path, destination: Path) -> dict:
-    """First page as a self-contained vector figure, with outlined fonts.
+def pdf_figure(source: Path, destination: Path, viewer: Path | None = None) -> dict:
+    """Render a vector poster and, for multi-page PDFs, fill the viewer.
 
     Use the same frozen MuPDF dependency as Keynote's embedded PDF conversion.
     Atomic publication means failed or concurrent imports cannot cache a partial
@@ -5068,9 +5069,9 @@ def pdf_figure(source: Path, destination: Path) -> dict:
             raise ValueError("This PDF is password-protected. Import an unlocked copy.")
         if not document.is_pdf or document.page_count == 0:
             raise ValueError("The file has no PDF pages.")
-        page = document.load_page(0)
-        if not destination.exists():
-            svg = page.get_svg_image(text_as_path=True)
+        first_page = document.load_page(0)
+        if not destination.is_file() or destination.stat().st_size == 0:
+            svg = first_page.get_svg_image(text_as_path=True)
             temporary = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -5083,7 +5084,23 @@ def pdf_figure(source: Path, destination: Path) -> dict:
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
-        return {"width": page.rect.width, "height": page.rect.height}
+        if viewer is not None and document.page_count > 1:
+            progress = Progress()
+            with viewer.open("a", encoding="utf8") as output:
+                for index, page in enumerate(document):
+                    number = index + 1
+                    progress.phase(f"Rendering PDF page {number} of {document.page_count}",
+                                   index / document.page_count)
+                    svg_bytes = destination.read_bytes() if index == 0 else page.get_svg_image(text_as_path=True).encode("utf8")
+                    encoded = base64.b64encode(svg_bytes).decode("ascii")
+                    loading = ' loading="lazy"' if index > 0 else ''
+                    output.write(
+                        f'<img alt="Page {number} of {document.page_count}"{loading}'
+                        f' style="aspect-ratio:{page.rect.width}/{page.rect.height}"'
+                        f' src="data:image/svg+xml;base64,{encoded}">\n'
+                    )
+        return {"width": first_page.rect.width, "height": first_page.rect.height,
+                "pageCount": document.page_count}
 
 
 def self_check() -> int:
@@ -5119,6 +5136,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("input", type=Path, help="Path to a .key file or bundle")
     parser.add_argument("--out", type=Path, help="Deck folder to create")
     parser.add_argument("--pdf-figure", action="store_true", help="Convert the first PDF page to an SVG at --out")
+    parser.add_argument("--pdf-viewer", type=Path, help="Append all PDF pages to a prepared viewer document")
     parser.add_argument(
         "--report",
         action="store_true",
@@ -5143,7 +5161,7 @@ def main(argv: list[str]) -> int:
             if args.pdf_figure:
                 if args.out is None:
                     raise ValueError("--out is required for a PDF figure")
-                figure = pdf_figure(args.input, args.out)
+                figure = pdf_figure(args.input, args.out, args.pdf_viewer)
             else:
                 figure = None
         if figure is not None:

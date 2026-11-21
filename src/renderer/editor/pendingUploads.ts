@@ -17,6 +17,7 @@ interface PendingState {
   phase: 'upload' | 'processing' | 'failed';
   ratio: number | null;
   preview: string | null;
+  message?: string;
 }
 
 const states = new Map<string, PendingState>();
@@ -29,7 +30,7 @@ export function setPendingPreview(token: string, preview: string | null): void {
 export function setPendingProgress(p: AssetImportProgress): void {
   const s = states.get(p.token);
   if (s?.phase === 'failed') return;
-  states.set(p.token, { phase: p.phase, ratio: p.ratio, preview: s?.preview ?? null });
+  states.set(p.token, { phase: p.phase, ratio: p.ratio, preview: s?.preview ?? null, message: p.message });
 }
 
 export function markPendingFailed(token: string): void {
@@ -63,8 +64,8 @@ export function applyPendingHud(root: ParentNode): void {
     }
     if (status) {
       const pct = state.ratio === null ? '' : ` ${Math.round(state.ratio * 100)}%`;
-      status.textContent =
-        state.phase === 'upload' ? `Uploading${pct}…` : `Processing${pct}…`;
+      const label = state.message ?? (state.phase === 'upload' ? 'Uploading' : 'Processing');
+      status.textContent = `${label}${pct}…`;
     }
   }
 }

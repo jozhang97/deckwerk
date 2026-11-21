@@ -1,6 +1,6 @@
 import { openContextMenu } from './contextMenuPlacement.js';
 import type { Deck, ShapeEl, Slide, SlideElement, TextEl } from '@shared/deck.js';
-import { NEW_MEDIA_FIT } from '@shared/deck.js';
+import { ElementSchema, NEW_MEDIA_FIT } from '@shared/deck.js';
 import { lineSpacingValue } from '@shared/lineHeight.js';
 import { canHoldText, shapeToTextBox } from '@shared/shapeText.js';
 import { flipped, moveCorner, polygonPoints } from '@shared/polygonShape.js';
@@ -8620,6 +8620,7 @@ export class EditorCanvas {
       const asset = assets[0];
       if (!asset) throw new Error('unsupported or unreadable file');
       this.resolvePendingAsset(drop.id, drop.w, drop.h, asset);
+      if (asset.pdfViewer) this.notice(`Added ${drop.file.name}. Double-click to scroll through the pages.`);
     } catch (err) {
       console.error(`Import failed for ${drop.file.name}:`, err);
       markPendingFailed(drop.id);
@@ -8644,7 +8645,7 @@ export class EditorCanvas {
       // by id alone left the copy a placeholder for good -- saved into the
       // deck, so it stayed broken after a reload too.
       for (const slide of d.slides) {
-        for (const el of slide.elements) {
+        for (const [index, el] of slide.elements.entries()) {
           if (el.type !== 'image' && el.type !== 'video') continue;
           if (pendingToken(el.src) !== token) continue;
           el.src = asset.src;
@@ -8652,13 +8653,19 @@ export class EditorCanvas {
           // local guess (a PDF, or an undecodable codec), refit it in place.
           if (el.w === w && el.h === h && asset.width && asset.height) {
             const maxW = d.canvas.w * 0.6;
-            const scale = Math.min(1, maxW / asset.width);
-            const fitW = Math.round(asset.width * scale);
-            const fitH = Math.round(asset.height * scale);
+            const maxH = asset.pdfViewer ? d.canvas.h * 0.8 : Infinity;
+            const scale = Math.min(asset.pdfViewer ? Infinity : 1, maxW / asset.width, maxH / asset.height);
+            const fitW = Math.max(1, Math.round(asset.width * scale));
+            const fitH = Math.max(1, Math.round(asset.height * scale));
             el.x = Math.round(el.x + (el.w - fitW) / 2);
             el.y = Math.round(el.y + (el.h - fitH) / 2);
             el.w = fitW;
             el.h = fitH;
+          }
+          if (el.type === 'image' && asset.pdfViewer) {
+            slide.elements[index] = ElementSchema.parse({
+              ...el, ...asset.pdfViewer, type: 'web', poster: asset.src, interactive: true,
+            });
           }
         }
       }

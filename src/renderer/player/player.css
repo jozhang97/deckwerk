@@ -100,6 +100,15 @@
   font-family: system-ui, sans-serif;
 }
 
+.pending-pdf:not(.upload-failed) .pending-asset-hud {
+  animation: pending-pdf-show 0s 500ms both;
+}
+
+@keyframes pending-pdf-show {
+  from { visibility: hidden; }
+  to { visibility: visible; }
+}
+
 .pending-asset-ring {
   width: 44px;
   height: 44px;

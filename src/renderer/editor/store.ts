@@ -1692,19 +1692,19 @@ function insertClipboardMedia(
   store: EditorStore,
   asset: Extract<ClipboardReadResult, { kind: 'external-image' }>['asset'],
 ): { kind: 'elements'; count: number } {
-  const id = makeId(asset.kind);
+  const id = makeId(asset.pdfViewer ? 'web' : asset.kind);
   store.commit((deck) => {
     const slide = deck.slides[store.get().slideIndex];
     if (!slide) return;
     const naturalW = asset.width ?? 1600;
     const naturalH = asset.height ?? 900;
     const scale = Math.min(
-      1,
+      asset.pdfViewer ? Infinity : 1,
       (deck.canvas.w * 0.8) / naturalW,
       (deck.canvas.h * 0.8) / naturalH,
     );
-    const w = Math.round(naturalW * scale);
-    const h = Math.round(naturalH * scale);
+    const w = Math.max(1, Math.round(naturalW * scale));
+    const h = Math.max(1, Math.round(naturalH * scale));
     const base = {
       id,
       x: Math.round((deck.canvas.w - w) / 2),
@@ -1716,6 +1716,15 @@ function insertClipboardMedia(
       opacity: 1,
       class: [],
       style: {},
+    };
+    if (asset.pdfViewer) {
+      slide.elements.push({
+        ...base, ...asset.pdfViewer, type: 'web', poster: asset.src, interactive: true,
+      });
+      return;
+    }
+    const media = {
+      ...base,
       src: asset.src,
       fit: NEW_MEDIA_FIT,
       sourceBox: null,
@@ -1723,7 +1732,7 @@ function insertClipboardMedia(
     // Same defaults as a video dropped onto the slide.
     slide.elements.push(asset.kind === 'video'
       ? {
-          ...base,
+          ...media,
           type: 'video',
           autoplay: true,
           loop: true,
@@ -1733,8 +1742,8 @@ function insertClipboardMedia(
           end: null,
           poster: null,
         }
-      : { ...base, type: 'image', alt: 'Pasted screenshot' });
-  }, { label: asset.kind === 'video' ? 'Paste video' : 'Paste screenshot' });
+      : { ...media, type: 'image', alt: 'Pasted screenshot' });
+  }, { label: asset.pdfViewer ? 'Paste PDF' : asset.kind === 'video' ? 'Paste video' : 'Paste screenshot' });
   store.select([id]);
   return { kind: 'elements', count: 1 };
 }

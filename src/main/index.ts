@@ -1138,12 +1138,13 @@ function registerHandlers(): void {
         // One bad file in a multi-file drop shouldn't lose the rest.
         try {
           out.push(
-            await importAsset(s.dir, p, (ratio) => {
+            await importAsset(s.dir, p, (ratio, message) => {
               if (token && !event.sender.isDestroyed()) {
                 event.sender.send(IPC.assetImportProgress, {
                   token,
                   phase: 'processing',
                   ratio,
+                  message,
                 });
               }
             }),
